@@ -253,8 +253,26 @@ unreachable for both parties and a dispute is the only way to unwind the deal.
    ```bash
    yarn deploy --network baseSepolia
    ```
-5. Point the frontend at it: add `chains.baseSepolia` to `targetNetworks` in
+5. Verify the contract on Basescan (needs the `ETHERSCAN_API_KEY` from step 3 — Basescan uses the
+   same Etherscan-compatible API):
+   ```bash
+   RPC_URL=baseSepolia yarn verify
+   ```
+   Note the `RPC_URL=...` env var form, not a trailing argument (`yarn verify baseSepolia`) — Yarn
+   4's script runner doesn't forward positional arguments into the `${1:-...}`-style shell
+   substitution the way Yarn Classic/npm did, so a trailing argument here is silently ignored and
+   falls back to `localhost`.
+6. Point the frontend at it: add `chains.baseSepolia` to `targetNetworks` in
    `packages/nextjs/scaffold.config.ts`.
+
+### Live deployment
+
+| Contract | Address | Explorer |
+|---|---|---|
+| `CommissionEscrowFactory` | `0x4879c5eaf2dc5E581C1e110905Db1338aED48594` | [View on Basescan](https://sepolia.basescan.org/address/0x4879c5eaf2dc5e581c1e110905db1338aed48594#code) |
+
+Deployed and verified on Base Sepolia following the steps above. `INITIAL_ARBITER` was left unset
+for this deployment, so the deployer address holds both `DEFAULT_ADMIN_ROLE` and `ARBITER_ROLE`.
 
 ## Security & repo hygiene
 
