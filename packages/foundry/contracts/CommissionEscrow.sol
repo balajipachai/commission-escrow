@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.35;
 
 import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -376,7 +376,11 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
         if (msg.value == 0) revert NoFundsSent();
         if (_collector == address(0)) revert ZeroAddress();
         if (_artisan == address(0)) revert ZeroAddress();
+        if (_factory == address(0)) revert ZeroAddress();
         if (_artisan == _collector) revert ArtisanEqualsCollector();
+        // slither-disable-next-line timestamp -- deadline comparison is the point of this field;
+        // a day/week-scale deadline is not meaningfully manipulable within a miner/validator's
+        // ~seconds-level timestamp leeway, and there is no more-trustless time source on EVM.
         if (_deadline <= block.timestamp) revert DeadlineNotInFuture();
 
         collector = _collector;
@@ -462,6 +466,8 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
      * 120% locked amount (see the contract-level docs on the confirmation deposit).
      */
     function confirmDelivery() external onlyCollector inStatus(Status.ORDER_SHIPPED) {
+        // slither-disable-next-line timestamp -- see the identical rationale on the deadline check
+        // in `initialize`; this is the same accepted, inherent tradeoff of a deadline-gated action.
         if (block.timestamp > deadline) revert DeadlineAlreadyPassed();
 
         status = Status.ORDER_DELIVERED;
@@ -533,6 +539,8 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
      */
     function refundAfterDeadline() external nonReentrant {
         if (status != Status.ORDER_PLACED && status != Status.ORDER_ACKNOWLEDGED) revert InvalidStatus();
+        // slither-disable-next-line timestamp -- see the identical rationale on the deadline check
+        // in `initialize`; this is the same accepted, inherent tradeoff of a deadline-gated action.
         if (block.timestamp <= deadline) revert DeadlineNotPassed();
 
         status = Status.ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED;
@@ -569,9 +577,13 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
         status = Status.ORDER_DISPUTED;
         disputeInitiator = msg.sender;
 
-        ICommissionEscrowFactory(factory).notifyDisputed(address(this));
-
+        // Event emitted before the external call below: it does not depend on that call's outcome
+        // (a revert there unwinds the whole transaction, this event included), so there is no reason
+        // to leave it - or, more importantly, this function's ability to be re-entered - exposed
+        // during the external call.
         emit DisputeRaised(msg.sender, block.timestamp);
+
+        ICommissionEscrowFactory(factory).notifyDisputed(address(this));
     }
 
     /**
@@ -644,6 +656,12 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
      * Checks-Effects-Interactions ordering at any call site.
      */
     function _transferETH(address to, uint256 value) private {
+        // slither-disable-next-line low-level-calls -- deliberate: `.call` with an explicit
+        // success check (not `.transfer`/`.send`) is the currently recommended way to send ETH,
+        // since `.transfer`/`.send` hard-cap forwarded gas at 2300 and break against smart-contract
+        // wallets or any receive()/fallback() doing more than a trivial write. `to` is always
+        // `collector`, `artisan`, or the resolving arbiter - never attacker-controlled - and every
+        // call site already applies Checks-Effects-Interactions plus `nonReentrant`.
         (bool success,) = to.call{ value: value }("");
         if (!success) revert EthTransferFailed();
     }

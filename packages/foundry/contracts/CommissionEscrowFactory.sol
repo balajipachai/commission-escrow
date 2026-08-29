@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.35;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
@@ -154,19 +154,24 @@ contract CommissionEscrowFactory is AccessControl {
         if (msg.value == 0) revert NoCommissionAmountSent();
 
         commission = Clones.clone(escrowImplementation);
-        // `msg.sender` becomes the collector; `initialize` re-validates every argument (zero address,
-        // artisan == collector, deadline in the past) so this factory does not have to duplicate those
-        // checks.
-        CommissionEscrow(payable(commission)).initialize{ value: msg.value }(
-            msg.sender, artisan, deadline, address(this)
-        );
 
+        // Checks-Effects-Interactions: every bit of this factory's own bookkeeping - including the
+        // event - is recorded before the external call to `initialize` below. None of it depends on
+        // that call's outcome (a revert there unwinds the whole transaction, these writes included),
+        // so there is no reason to leave them exposed to reentrancy during the external call.
         isCommission[commission] = true;
         allCommissions.push(commission);
         commissionsByCollector[msg.sender].push(commission);
         commissionsByArtisan[artisan].push(commission);
 
         emit CommissionCreated(commission, msg.sender, artisan, msg.value, deadline);
+
+        // `msg.sender` becomes the collector; `initialize` re-validates every argument (zero address,
+        // artisan == collector, deadline in the past) so this factory does not have to duplicate those
+        // checks.
+        CommissionEscrow(payable(commission)).initialize{ value: msg.value }(
+            msg.sender, artisan, deadline, address(this)
+        );
     }
 
     // ---------------------------------------------------------------------------------------------
