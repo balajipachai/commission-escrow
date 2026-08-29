@@ -1,4 +1,3 @@
-
 import fs from "fs";
 import path from "path";
 import { Address } from "viem";
@@ -48,12 +47,7 @@ const getContractData = async (address: Address) => {
     return null;
   }
 
-  const artifactsDirectory = path.join(
-    process.cwd(),
-    "..",
-    "foundry",
-    "out",
-  );
+  const artifactsDirectory = path.join(process.cwd(), "..", "foundry", "out");
 
   if (!fs.existsSync(artifactsDirectory)) {
     throw new Error(`Directory ${artifactsDirectory} not found.`);
