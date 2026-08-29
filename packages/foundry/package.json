@@ -12,12 +12,12 @@
     "compile": "make compile",
     "deploy": "node scripts-js/parseArgs.js",
     "flatten": "make flatten",
-    "fork": "make fork FORK_URL=${1:-mainnet}",
+    "fork": "make fork FORK_URL=${FORK_URL:-mainnet}",
     "format": "make format",
     "postinstall": "shx cp -n .env.example .env",
     "lint": "make lint",
     "test": "forge test",
-    "verify": "make verify RPC_URL=${1:-localhost}"
+    "verify": "make verify RPC_URL=${RPC_URL:-localhost}"
   },
   "dependencies": {
     "dotenv": "~16.3.1",
