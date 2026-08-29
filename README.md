@@ -270,9 +270,14 @@ unreachable for both parties and a dispute is the only way to unwind the deal.
 | Contract | Address | Explorer |
 |---|---|---|
 | `CommissionEscrowFactory` | `0x4879c5eaf2dc5E581C1e110905Db1338aED48594` | [View on Basescan](https://sepolia.basescan.org/address/0x4879c5eaf2dc5e581c1e110905db1338aed48594#code) |
+| `CommissionEscrow` (implementation) | `0xb1c58ac371e30F54Cfda88cc1423ad1f7b6A73D0` | [View on Basescan](https://sepolia.basescan.org/address/0xb1c58ac371e30f54cfda88cc1423ad1f7b6a73d0#code) |
 
 Deployed and verified on Base Sepolia following the steps above. `INITIAL_ARBITER` was left unset
 for this deployment, so the deployer address holds both `DEFAULT_ADMIN_ROLE` and `ARBITER_ROLE`.
+The implementation address is deployed internally by the factory's constructor (see
+`escrowImplementation`) - it doesn't show up as its own top-level transaction in the broadcast
+log, so it had to be verified as a separate `forge verify-contract` call rather than picked up by
+`yarn verify`'s automatic sweep.
 
 ## Security & repo hygiene
 
