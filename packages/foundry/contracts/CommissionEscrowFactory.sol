@@ -22,7 +22,7 @@ import { CommissionEscrow } from "./CommissionEscrow.sol";
  *      currently disputed, so an arbiter can simply browse {getDisputedCommissions} to find work
  *      (and earn the 1% resolution fee described in {CommissionEscrow-resolveDispute}).
  *
- * @dev DEFAULT_ADMIN_ROLE (granted to the address passed into the constructor - see
+ * @dev DEFAULT_ADMIN_ROLE (granted to the `admin` address passed into the constructor - see
  * `DeployCommissionEscrowFactory.s.sol`) is the only role that can grant/revoke `ARBITER_ROLE`, via
  * the standard `AccessControl.grantRole` / `revokeRole` functions inherited below. There is
  * intentionally no custom "addArbiter" function - `AccessControl`'s own functions already do
@@ -37,6 +37,26 @@ contract CommissionEscrowFactory is AccessControl {
     /// constant of the same name in {CommissionEscrow} - both are `keccak256("ARBITER_ROLE")`, so a
     /// role granted here is recognised by every commission clone.
     bytes32 public constant ARBITER_ROLE = keccak256("ARBITER_ROLE");
+
+    // ---------------------------------------------------------------------------------------------
+    // Errors
+    // ---------------------------------------------------------------------------------------------
+
+    /// @notice Thrown when a required address argument is the zero address.
+    error ZeroAddress();
+
+    /// @notice Thrown when `createCommission` is called with no ETH attached.
+    error NoCommissionAmountSent();
+
+    /// @notice Thrown when `notifyDisputed` / `notifyDisputeSettled` is called by something other
+    /// than a genuine commission clone this factory created.
+    error NotGenuineCommission();
+
+    /// @notice Thrown when `notifyDisputed` is called for a commission already on the disputed list.
+    error AlreadyDisputed();
+
+    /// @notice Thrown when `notifyDisputeSettled` is called for a commission not on the disputed list.
+    error NotListedAsDisputed();
 
     // ---------------------------------------------------------------------------------------------
     // Storage
@@ -80,22 +100,37 @@ contract CommissionEscrowFactory is AccessControl {
     );
 
     // ---------------------------------------------------------------------------------------------
+    // Modifiers
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev Restricts a function to a commission clone this factory actually created, calling about
+    /// itself. Shared by {notifyDisputed} and {notifyDisputeSettled}.
+    modifier onlyGenuineCommission(address commission) {
+        if (!isCommission[msg.sender] || msg.sender != commission) revert NotGenuineCommission();
+        _;
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Constructor
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * @param admin Address granted `DEFAULT_ADMIN_ROLE` (able to grant/revoke `ARBITER_ROLE`) and, as
-     * a convenience so the system has at least one working arbiter immediately after deployment,
-     * `ARBITER_ROLE` itself. In production you would typically grant `ARBITER_ROLE` to a multisig or
-     * DAO instead of/in addition to a single EOA.
+     * @param admin Address granted `DEFAULT_ADMIN_ROLE`, i.e. able to grant/revoke `ARBITER_ROLE` for
+     * any address (including itself) going forward.
+     * @param arbiter Address granted `ARBITER_ROLE` directly, so the system has at least one working
+     * arbiter immediately after deployment. Passed as an explicit, independent argument (rather than
+     * automatically reusing `admin`) so that deployments can hand day-to-day dispute resolution to a
+     * different address - e.g. a dedicated multisig - than the address controlling role management.
+     * `admin` and `arbiter` may be the same address if that separation isn't needed.
      */
-    constructor(address admin) {
-        require(admin != address(0), "CommissionEscrowFactory: admin is the zero address");
+    constructor(address admin, address arbiter) {
+        if (admin == address(0)) revert ZeroAddress();
+        if (arbiter == address(0)) revert ZeroAddress();
 
         escrowImplementation = address(new CommissionEscrow());
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
-        _grantRole(ARBITER_ROLE, admin);
+        _grantRole(ARBITER_ROLE, arbiter);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -116,7 +151,7 @@ contract CommissionEscrowFactory is AccessControl {
      * @return commission The address of the newly created, funded {CommissionEscrow} clone.
      */
     function createCommission(address artisan, uint256 deadline) external payable returns (address commission) {
-        require(msg.value > 0, "CommissionEscrowFactory: no commission amount sent");
+        if (msg.value == 0) revert NoCommissionAmountSent();
 
         commission = Clones.clone(escrowImplementation);
         // `msg.sender` becomes the collector; `initialize` re-validates every argument (zero address,
@@ -141,17 +176,9 @@ contract CommissionEscrowFactory is AccessControl {
     /**
      * @notice Adds `commission` to the public disputed-commissions list. Called automatically by a
      * {CommissionEscrow} clone from inside its own `raiseDispute()` - never call this directly.
-     * @dev Reverts unless `msg.sender` both (a) is a commission this factory created and (b) equals
-     * `commission`, so only a genuine escrow clone can register *itself* as disputed.
      */
-    function notifyDisputed(address commission) external {
-        require(
-            isCommission[msg.sender] && msg.sender == commission,
-            "CommissionEscrowFactory: caller is not a commission created by this factory"
-        );
-        require(
-            _disputedIndexPlusOne[commission] == 0, "CommissionEscrowFactory: commission already listed as disputed"
-        );
+    function notifyDisputed(address commission) external onlyGenuineCommission(commission) {
+        if (_disputedIndexPlusOne[commission] != 0) revert AlreadyDisputed();
 
         disputedCommissions.push(commission);
         _disputedIndexPlusOne[commission] = disputedCommissions.length;
@@ -161,17 +188,11 @@ contract CommissionEscrowFactory is AccessControl {
      * @notice Removes `commission` from the public disputed-commissions list. Called automatically
      * by a {CommissionEscrow} clone from inside its own `resolveDispute()` - never call this
      * directly.
-     * @dev Same caller restriction as {notifyDisputed}. Uses swap-and-pop so removal is O(1)
-     * regardless of list size.
+     * @dev Uses swap-and-pop so removal is O(1) regardless of list size.
      */
-    function notifyDisputeSettled(address commission) external {
-        require(
-            isCommission[msg.sender] && msg.sender == commission,
-            "CommissionEscrowFactory: caller is not a commission created by this factory"
-        );
-
+    function notifyDisputeSettled(address commission) external onlyGenuineCommission(commission) {
         uint256 indexPlusOne = _disputedIndexPlusOne[commission];
-        require(indexPlusOne != 0, "CommissionEscrowFactory: commission is not listed as disputed");
+        if (indexPlusOne == 0) revert NotListedAsDisputed();
 
         uint256 indexToRemove = indexPlusOne - 1;
         uint256 lastIndex = disputedCommissions.length - 1;

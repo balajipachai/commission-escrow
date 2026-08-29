@@ -26,7 +26,9 @@ contract CommissionEscrowTest is Test {
     uint256 internal deadline;
 
     function setUp() public {
-        factory = new CommissionEscrowFactory(admin);
+        // `admin` is passed as both the admin and the initial arbiter here purely for test
+        // convenience (see CommissionEscrowFactory.t.sol for coverage of them being distinct).
+        factory = new CommissionEscrowFactory(admin, admin);
         deadline = block.timestamp + 7 days;
 
         vm.deal(collector, 100 ether);
@@ -51,6 +53,20 @@ contract CommissionEscrowTest is Test {
         factory.grantRole(arbiterRole, account);
     }
 
+    /// @dev Helper: artisan accepts the commission, moving it from ORDER_PLACED to ORDER_ACKNOWLEDGED.
+    function _acknowledge(CommissionEscrow escrow) internal {
+        vm.prank(artisan);
+        escrow.acknowledgeCommission();
+    }
+
+    /// @dev Helper: walks a fresh commission all the way to ORDER_DELIVERED (artisan acknowledges,
+    /// then collector confirms delivery), the prerequisite state for `release()`.
+    function _acknowledgeAndConfirmDelivery(CommissionEscrow escrow) internal {
+        _acknowledge(escrow);
+        vm.prank(collector);
+        escrow.confirmDelivery();
+    }
+
     // =================================================================================================
     // Test Case 1 - Escrow holds funds before work begins
     // =================================================================================================
@@ -64,7 +80,7 @@ contract CommissionEscrowTest is Test {
 
     function test_RevertWhen_CreatingCommissionWithNoValue() public {
         vm.prank(collector);
-        vm.expectRevert("CommissionEscrowFactory: no commission amount sent");
+        vm.expectRevert(CommissionEscrowFactory.NoCommissionAmountSent.selector);
         factory.createCommission(artisan, deadline);
     }
 
@@ -91,32 +107,71 @@ contract CommissionEscrowTest is Test {
     // Test Case 2 - Release requires confirmed delivery
     // =================================================================================================
 
+    function test_ArtisanCanAcknowledgeCommission() public {
+        CommissionEscrow escrow = _createCommission();
+
+        _acknowledge(escrow);
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_ACKNOWLEDGED));
+    }
+
+    function test_RevertWhen_CollectorAcknowledgesCommission() public {
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(collector);
+        vm.expectRevert(CommissionEscrow.NotArtisan.selector);
+        escrow.acknowledgeCommission();
+    }
+
+    function test_RevertWhen_StrangerAcknowledgesCommission() public {
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(stranger);
+        vm.expectRevert(CommissionEscrow.NotArtisan.selector);
+        escrow.acknowledgeCommission();
+    }
+
+    function test_RevertWhen_ConfirmDeliveryBeforeAcknowledgement() public {
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(collector);
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
+        escrow.confirmDelivery();
+    }
+
     function test_RevertWhen_ReleaseCalledBeforeDeliveryConfirmed() public {
         CommissionEscrow escrow = _createCommission();
-        vm.expectRevert("CommissionEscrow: invalid status for this action");
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.release();
     }
 
-    function test_RevertWhen_CollectorConfirmsDeliveryInsteadOfArtisan() public {
+    /// @notice This is the regression test for the fix requested in review: previously
+    /// `confirmDelivery()` was `onlyArtisan`, which meant a dishonest artisan could confirm their
+    /// own "delivery" and walk away with `release()` without ever doing the work. Now that
+    /// `confirmDelivery()` is `onlyCollector`, the artisan calling it - even after legitimately
+    /// acknowledging the commission - must revert.
+    function test_RevertWhen_ArtisanConfirmsOwnDelivery() public {
         CommissionEscrow escrow = _createCommission();
-        vm.prank(collector);
-        vm.expectRevert("CommissionEscrow: caller is not the artisan");
+        _acknowledge(escrow);
+
+        vm.prank(artisan);
+        vm.expectRevert(CommissionEscrow.NotCollector.selector);
         escrow.confirmDelivery();
     }
 
     function test_RevertWhen_StrangerConfirmsDelivery() public {
         CommissionEscrow escrow = _createCommission();
         vm.prank(stranger);
-        vm.expectRevert("CommissionEscrow: caller is not the artisan");
+        vm.expectRevert(CommissionEscrow.NotCollector.selector);
         escrow.confirmDelivery();
     }
 
-    function test_ReleaseSucceedsOnlyAfterArtisanConfirmsDelivery() public {
+    function test_ReleaseSucceedsOnlyAfterCollectorConfirmsDelivery() public {
         CommissionEscrow escrow = _createCommission();
 
-        vm.prank(artisan);
+        _acknowledge(escrow);
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_ACKNOWLEDGED));
+
+        vm.prank(collector);
         escrow.confirmDelivery();
-        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_RECEIVED));
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DELIVERED));
 
         uint256 artisanBalanceBefore = artisan.balance;
         escrow.release();
@@ -139,6 +194,9 @@ contract CommissionEscrowTest is Test {
         malicious.setEscrow(escrow);
 
         vm.prank(address(malicious));
+        escrow.acknowledgeCommission();
+
+        vm.prank(collector);
         escrow.confirmDelivery();
 
         // This call must succeed exactly once. Inside it, `malicious.receive()` tries to call
@@ -159,7 +217,7 @@ contract CommissionEscrowTest is Test {
 
     function test_RevertWhen_RefundCalledBeforeDeadline() public {
         CommissionEscrow escrow = _createCommission();
-        vm.expectRevert("CommissionEscrow: deadline has not passed yet");
+        vm.expectRevert(CommissionEscrow.DeadlineNotPassed.selector);
         escrow.refundAfterDeadline();
     }
 
@@ -175,6 +233,27 @@ contract CommissionEscrowTest is Test {
         assertEq(address(escrow).balance, 0);
     }
 
+    function test_RefundAfterDeadlineReachableFromAcknowledgedStatus() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledge(escrow);
+
+        vm.warp(deadline + 1);
+        uint256 collectorBalanceBefore = collector.balance;
+        escrow.refundAfterDeadline();
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED));
+        assertEq(collector.balance, collectorBalanceBefore + COMMISSION_PRICE);
+    }
+
+    function test_RevertWhen_RefundAttemptedAfterDeliveryConfirmed() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledgeAndConfirmDelivery(escrow);
+
+        vm.warp(deadline + 1);
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
+        escrow.refundAfterDeadline();
+    }
+
     function test_RevertWhen_RefundAttemptedOnDisputedCommissionAfterDeadline() public {
         CommissionEscrow escrow = _createCommission();
 
@@ -182,7 +261,7 @@ contract CommissionEscrowTest is Test {
         escrow.raiseDispute();
 
         vm.warp(deadline + 1);
-        vm.expectRevert("CommissionEscrow: invalid status for this action");
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.refundAfterDeadline();
     }
 
@@ -192,13 +271,12 @@ contract CommissionEscrowTest is Test {
 
     function test_RevertWhen_CollectorResolvesOwnDispute() public {
         CommissionEscrow escrow = _createCommission();
-        vm.prank(artisan);
-        escrow.confirmDelivery();
+        _acknowledgeAndConfirmDelivery(escrow);
         vm.prank(collector);
         escrow.raiseDispute();
 
         vm.prank(collector);
-        vm.expectRevert("CommissionEscrow: caller is not an arbiter");
+        vm.expectRevert(CommissionEscrow.NotArbiter.selector);
         escrow.resolveDispute(false);
     }
 
@@ -208,23 +286,33 @@ contract CommissionEscrowTest is Test {
         escrow.raiseDispute();
 
         vm.prank(artisan);
-        vm.expectRevert("CommissionEscrow: caller is not an arbiter");
+        vm.expectRevert(CommissionEscrow.NotArbiter.selector);
         escrow.resolveDispute(true);
     }
 
     function test_RevertWhen_ResolvingDisputeThatWasNeverRaised() public {
         CommissionEscrow escrow = _createCommission();
         vm.prank(admin); // admin holds ARBITER_ROLE from the factory constructor
-        vm.expectRevert("CommissionEscrow: invalid status for this action");
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.resolveDispute(true);
+    }
+
+    function test_RaiseDisputeReachableFromAcknowledgedStatus() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledge(escrow);
+
+        vm.prank(artisan);
+        escrow.raiseDispute();
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTED));
+        assertEq(factory.getDisputedCommissions().length, 1);
     }
 
     function test_ApprovedArbiterResolvesDisputeInFavorOfArtisan() public {
         _grantArbiterRole(arbiter);
 
         CommissionEscrow escrow = _createCommission();
-        vm.prank(artisan);
-        escrow.confirmDelivery();
+        _acknowledgeAndConfirmDelivery(escrow);
         vm.prank(collector);
         escrow.raiseDispute();
 
@@ -264,7 +352,7 @@ contract CommissionEscrowTest is Test {
     function test_RevertWhen_StrangerRaisesDispute() public {
         CommissionEscrow escrow = _createCommission();
         vm.prank(stranger);
-        vm.expectRevert("CommissionEscrow: caller is not a party to this deal");
+        vm.expectRevert(CommissionEscrow.NotPartyToDeal.selector);
         escrow.raiseDispute();
     }
 
@@ -274,11 +362,10 @@ contract CommissionEscrowTest is Test {
 
     function test_RevertWhen_ReleaseCalledTwice() public {
         CommissionEscrow escrow = _createCommission();
-        vm.prank(artisan);
-        escrow.confirmDelivery();
+        _acknowledgeAndConfirmDelivery(escrow);
         escrow.release();
 
-        vm.expectRevert("CommissionEscrow: invalid status for this action");
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.release();
     }
 
@@ -287,7 +374,7 @@ contract CommissionEscrowTest is Test {
         vm.warp(deadline + 1);
         escrow.refundAfterDeadline();
 
-        vm.expectRevert("CommissionEscrow: invalid status for this action");
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.refundAfterDeadline();
     }
 
@@ -302,7 +389,7 @@ contract CommissionEscrowTest is Test {
         escrow.resolveDispute(false);
 
         vm.prank(arbiter);
-        vm.expectRevert("CommissionEscrow: invalid status for this action");
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.resolveDispute(false);
     }
 
@@ -311,12 +398,12 @@ contract CommissionEscrowTest is Test {
         vm.warp(deadline + 1);
         escrow.refundAfterDeadline();
 
-        vm.expectRevert("CommissionEscrow: invalid status for this action");
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.release();
     }
 
     // =================================================================================================
-    // Extra coverage - the artisan-initiated cancellation path (ORDER_CANCELLED)
+    // Cancellation (ORDER_CANCELLED) - either party, only before acknowledgment
     // =================================================================================================
 
     function test_ArtisanCancelRefundsCollector() public {
@@ -331,20 +418,40 @@ contract CommissionEscrowTest is Test {
         assertEq(address(escrow).balance, 0);
     }
 
-    function test_RevertWhen_CollectorCancels() public {
+    function test_CollectorCancelRefundsCollector() public {
         CommissionEscrow escrow = _createCommission();
+        uint256 collectorBalanceBefore = collector.balance;
+
         vm.prank(collector);
-        vm.expectRevert("CommissionEscrow: caller is not the artisan");
+        escrow.cancel();
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_CANCELLED));
+        assertEq(collector.balance, collectorBalanceBefore + COMMISSION_PRICE);
+        assertEq(address(escrow).balance, 0);
+    }
+
+    function test_RevertWhen_StrangerCancels() public {
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(stranger);
+        vm.expectRevert(CommissionEscrow.NotPartyToDeal.selector);
         escrow.cancel();
     }
 
-    function test_RevertWhen_CancelCalledAfterDeliveryConfirmed() public {
+    function test_RevertWhen_ArtisanCancelsAfterAcknowledgement() public {
         CommissionEscrow escrow = _createCommission();
-        vm.prank(artisan);
-        escrow.confirmDelivery();
+        _acknowledge(escrow);
 
         vm.prank(artisan);
-        vm.expectRevert("CommissionEscrow: invalid status for this action");
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
+        escrow.cancel();
+    }
+
+    function test_RevertWhen_CollectorCancelsAfterAcknowledgement() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledge(escrow);
+
+        vm.prank(collector);
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.cancel();
     }
 }

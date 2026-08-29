@@ -29,7 +29,7 @@ Collector ──funds──▶  CommissionEscrow  ──releases on delivery─�
   funding, delivery confirmation, payout, timeout refunds, early cancellation, and dispute
   resolution. Uses OpenZeppelin's `ReentrancyGuard` and the Checks-Effects-Interactions pattern
   throughout, so state is always finalized before any ETH leaves the contract.
-- **`packages/foundry/test/`** — 34 Foundry tests covering the full lifecycle (see [Running the
+- **`packages/foundry/test/`** — 45 Foundry tests covering the full lifecycle (see [Running the
   tests](#running-the-tests) below).
 - **`packages/nextjs/`** — the stock Scaffold-ETH 2 frontend. No custom pages were built for this
   challenge; the built-in **Debug Contracts** page is enough to fund, confirm, release, dispute and
@@ -77,8 +77,11 @@ yarn deploy
 
 Runs `packages/foundry/script/DeployCommissionEscrowFactory.s.sol`, which deploys
 `CommissionEscrowFactory` (this also deploys the one shared `CommissionEscrow` implementation the
-factory clones from) and grants the deployer both `DEFAULT_ADMIN_ROLE` and `ARBITER_ROLE`. It then
-auto-generates the TypeScript ABI the frontend needs at
+factory clones from). The deployer always gets `DEFAULT_ADMIN_ROLE`; `ARBITER_ROLE` goes to
+whatever address is set in the `INITIAL_ARBITER` environment variable, or falls back to the
+deployer if that's unset — so there's always at least one working arbiter out of the box, but a
+real deployment can hand day-to-day dispute resolution to a separate address (e.g. a multisig)
+from the start. The script then auto-generates the TypeScript ABI the frontend needs at
 `packages/nextjs/contracts/deployedContracts.ts`.
 
 **4. Terminal 3 — start the frontend**
@@ -105,15 +108,19 @@ A full happy-path walkthrough:
 2. Paste that address into the **"Read/Write custom contract"** section of `/debug` using the
    `CommissionEscrow` ABI (or just add its address under `getCommissionsByArtisan` /
    `getCommissionsByCollector` results) to interact with that specific commission.
-3. **As the artisan** (switch burner wallet), call `confirmDelivery()`.
-4. Anyone can now call `release()` — the artisan receives the full amount.
-5. To see the dispute path instead: after step 1, **as the collector or artisan**, call
-   `raiseDispute()`. As the deployer (who already holds `ARBITER_ROLE`), call
-   `resolveDispute(true)` (pay the artisan) or `resolveDispute(false)` (refund the collector) — the
-   resolving address always keeps a 1% fee.
-6. To see the timeout path: let the `deadline` you chose pass, then call `refundAfterDeadline()` —
-   the collector gets their money back automatically. If a dispute is open, this reverts instead,
-   exactly as intended.
+3. **As the artisan** (switch burner wallet), call `acknowledgeCommission()` to accept the job.
+4. **As the collector** (switch burner wallet back), call `confirmDelivery()` once the work has
+   actually arrived — this is the step that closes the "artisan pays themselves" loophole, since
+   only the collector can attest that delivery really happened.
+5. Anyone can now call `release()` — the artisan receives the full amount.
+6. To see the dispute path instead: at any point before release, **as the collector or artisan**,
+   call `raiseDispute()`. As the deployer (who holds `ARBITER_ROLE` unless you configured a
+   different `INITIAL_ARBITER`), call `resolveDispute(true)` (pay the artisan) or
+   `resolveDispute(false)` (refund the collector) — the resolving address always keeps a 1% fee.
+7. To see the timeout path: let the `deadline` you chose pass while still in `ORDER_PLACED` or
+   `ORDER_ACKNOWLEDGED`, then call `refundAfterDeadline()` — the collector gets their money back
+   automatically. If a dispute is open, or delivery has already been confirmed, this reverts
+   instead, exactly as intended.
 
 ## Running the tests
 
@@ -129,7 +136,7 @@ for the exact mapping):
 | # | Requirement | Covered in |
 |---|---|---|
 | 1 | Escrow holds funds before work begins | `CommissionEscrow.t.sol` — `test_EscrowHoldsFundsAtCreation` |
-| 2 | Release requires confirmed delivery | `test_RevertWhen_ReleaseCalledBeforeDeliveryConfirmed`, `test_RevertWhen_CollectorConfirmsDeliveryInsteadOfArtisan`, `test_ReleaseSucceedsOnlyAfterArtisanConfirmsDelivery` |
+| 2 | Release requires confirmed delivery | `test_RevertWhen_ReleaseCalledBeforeDeliveryConfirmed`, `test_RevertWhen_ArtisanConfirmsOwnDelivery` (the artisan cannot fake their own delivery), `test_ReleaseSucceedsOnlyAfterCollectorConfirmsDelivery` |
 | 3 | State updated before external transfer | `test_RevertWhen_MaliciousArtisanReentersOnRelease` (a hostile artisan contract tries to re-enter `release()` from its `receive()` hook) |
 | 4 | Timeout produces an explicit refund path | `test_RefundAfterDeadlineReturnsFundsToCollector`, `test_RevertWhen_RefundAttemptedOnDisputedCommissionAfterDeadline` |
 | 5 | Disputes aren't resolved by either party alone | `test_RevertWhen_CollectorResolvesOwnDispute`, `test_RevertWhen_ArtisanResolvesOwnDispute`, `test_ApprovedArbiterResolvesDisputeInFavorOfArtisan` |
@@ -145,12 +152,15 @@ arbiter roster, and the disputed-commissions "marketplace" list lifecycle.
 ```mermaid
 stateDiagram-v2
     [*] --> ORDER_PLACED: createCommission()\n(funds locked)
-    ORDER_PLACED --> ORDER_RECEIVED: confirmDelivery()\n[artisan only]
-    ORDER_RECEIVED --> ORDER_FULFILLED: release()\n(anyone can trigger)
-    ORDER_PLACED --> ORDER_CANCELLED: cancel()\n[artisan only]
+    ORDER_PLACED --> ORDER_ACKNOWLEDGED: acknowledgeCommission()\n[artisan only]
+    ORDER_ACKNOWLEDGED --> ORDER_DELIVERED: confirmDelivery()\n[collector only]
+    ORDER_DELIVERED --> ORDER_FULFILLED: release()\n(anyone can trigger)
+    ORDER_PLACED --> ORDER_CANCELLED: cancel()\n[collector or artisan]
     ORDER_PLACED --> ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED: refundAfterDeadline()\n[deadline passed]
+    ORDER_ACKNOWLEDGED --> ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED: refundAfterDeadline()\n[deadline passed]
     ORDER_PLACED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
-    ORDER_RECEIVED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
+    ORDER_ACKNOWLEDGED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
+    ORDER_DELIVERED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
     ORDER_DISPUTED --> ORDER_DISPUTE_RESOLVED: resolveDispute()\n[arbiter only, 1% fee]
     ORDER_FULFILLED --> [*]
     ORDER_CANCELLED --> [*]
@@ -158,20 +168,28 @@ stateDiagram-v2
     ORDER_DISPUTE_RESOLVED --> [*]
 ```
 
-Every arrow above corresponds to exactly one function in `CommissionEscrow.sol`. The four states at
-the bottom (`ORDER_FULFILLED`, `ORDER_CANCELLED`, `ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED`,
-`ORDER_DISPUTE_RESOLVED`) are terminal — every payout function checks the commission's current
-status before moving funds and flips it to a terminal value *before* sending any ETH, so calling a
-payout function twice on the same commission always reverts the second time.
+Every arrow above corresponds to exactly one function in `CommissionEscrow.sol`. Note `confirmDelivery()`
+is deliberately `[collector only]`, not artisan — if the artisan could confirm their own delivery, a
+dishonest artisan could call it (and then `release()`) without ever doing the work. `cancel()` is
+only reachable from `ORDER_PLACED`: once the artisan acknowledges, walking away requires a dispute
+instead. The four states at the bottom (`ORDER_FULFILLED`, `ORDER_CANCELLED`,
+`ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED`, `ORDER_DISPUTE_RESOLVED`) are terminal — every payout
+function checks the commission's current status before moving funds and flips it to a terminal
+value *before* sending any ETH, so calling a payout function twice on the same commission always
+reverts the second time.
 
 ### Roles
 
 | Role | Who | Can do |
 |---|---|---|
-| Collector | Whoever called `createCommission()` | `raiseDispute()` — note `cancel()` is artisan-only, so the collector can't self-refund early |
-| Artisan | The address named in `createCommission()` | `confirmDelivery()`, `cancel()`, `raiseDispute()` |
+| Collector | Whoever called `createCommission()` | `confirmDelivery()`, `cancel()`, `raiseDispute()` |
+| Artisan | The address named in `createCommission()` | `acknowledgeCommission()`, `cancel()`, `raiseDispute()` |
 | Arbiter | Any address the factory admin has granted `ARBITER_ROLE` (via `grantRole`) | `resolveDispute()` on **any** disputed commission from **any** collector/artisan pair — this shared roster plus the 1% fee is the "marketplace" that keeps disputes from sitting open forever |
 | Anyone | — | `release()`, `refundAfterDeadline()` — deliberately unrestricted, since there's nothing to gain by gatekeeping who *triggers* a payout that's already fully determined by on-chain state |
+
+`cancel()` can be called by either the collector or the artisan, but only while the commission is
+still `ORDER_PLACED` — the moment the artisan acknowledges it, `cancel()` becomes unreachable for
+both parties and a dispute is the only way to unwind the deal.
 
 ## Deploying to Base Sepolia
 
@@ -182,7 +200,9 @@ payout function twice on the same commission always reverts the second time.
    ```
 2. Fund that address with Base Sepolia ETH from a faucet.
 3. Add your own `ALCHEMY_API_KEY` (and optionally `ETHERSCAN_API_KEY` for verification) to
-   `packages/foundry/.env` — copy `.env.example` first if you haven't.
+   `packages/foundry/.env` — copy `.env.example` first if you haven't. Optionally also set
+   `INITIAL_ARBITER` to a different address (e.g. a multisig) if you don't want the deployer itself
+   holding `ARBITER_ROLE` — it defaults to the deployer if left unset.
 4. Deploy:
    ```bash
    yarn deploy --network baseSepolia
@@ -217,7 +237,12 @@ README, using Scaffold-ETH 2's stock Debug Contracts page as the UI. Left for la
   artisan / arbiter) instead of raw ABI calls, live status/countdown badges, and a browsable list
   of the disputed-commissions "marketplace" for arbiters.
 - Wiring `confirmDelivery()` to a real off-chain oracle/keeper that watches a carrier's AWB
-  (air waybill) tracking status, instead of a direct artisan-triggered call.
+  (air waybill) tracking status, instead of a direct collector-triggered call.
+- **N-of-M / multisig-style arbiter voting.** `resolveDispute()` currently trusts a single
+  `ARBITER_ROLE` holder's verdict — nothing on-chain can stop a colluding arbiter from lying (see
+  the `@dev` block on `resolveDispute()` for the full reasoning on why the verdict has to be a
+  function parameter in the first place). Requiring several independent arbiters to agree before
+  funds move would raise the cost of collusion considerably and is the natural next step here.
 - Hardening: a formal audit / Slither static-analysis pass, fuzz and invariant tests (Foundry
   supports both) on top of the current unit tests, an upgrade path for the arbiter fee percentage,
   and event indexing (a subgraph or similar) so front-ends aren't limited to on-chain reads.

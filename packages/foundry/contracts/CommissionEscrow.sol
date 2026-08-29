@@ -28,9 +28,10 @@ interface ICommissionEscrowFactory {
  * @notice One `CommissionEscrow` instance represents exactly ONE commission deal between exactly
  *         ONE collector (the buyer, e.g. the Berlin collector) and exactly ONE artisan (the seller,
  *         e.g. Kalpana). The collector's payment is locked inside this contract the moment the
- *         commission is created, and it can only leave the contract in one of three ways:
+ *         commission is created, and it can only leave the contract in one of four ways:
  *           1. `release()`      -> paid out to the artisan, once delivery has been confirmed.
- *           2. `cancel()`       -> refunded to the collector, if the artisan backs out early.
+ *           2. `cancel()`       -> refunded to the collector, if either party backs out before the
+ *              artisan has acknowledged the commission.
  *           3. `refundAfterDeadline()` -> refunded to the collector if the deadline passes with no
  *              delivery confirmation and no dispute.
  *           4. `resolveDispute()` -> split between the winning party and the arbiter who resolved
@@ -58,11 +59,11 @@ interface ICommissionEscrowFactory {
  *
  * Why "Checks-Effects-Interactions" (CEI)?
  *   Every function that moves ETH out of this contract first updates `status` (and any other
- *   storage this contract cares about) to its new, final value, and only *afterwards* makes the
- *   external call that actually sends the ETH. That way, even if the receiving address is a
- *   malicious contract that tries to call back into this escrow, it will find `status` already
- *   flipped to a terminal value and every guarded function will revert. `nonReentrant` is a second,
- *   belt-and-braces layer on top of that.
+ *   storage this contract cares about) to its new, final value, and only *afterwards* calls
+ *   `_transferETH`, which makes the external call that actually sends the ETH. That way, even if
+ *   the receiving address is a malicious contract that tries to call back into this escrow, it will
+ *   find `status` already flipped to a terminal value and every guarded function will revert.
+ *   `nonReentrant` is a second, belt-and-braces layer on top of that.
  */
 contract CommissionEscrow is Initializable, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
@@ -70,33 +71,43 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * @notice Every possible state a commission can be in, in the order they were called out in the
-     *         project brief.
+     * @notice Every possible state a commission can be in.
      *
      *  ORDER_PLACED                         Commission created & funded. Waiting for the artisan to
-     *                                        confirm delivery, for the deadline to pass, or for
-     *                                        either party to raise a dispute.
-     *  ORDER_RECEIVED                       The artisan has confirmed the work was delivered. Funds
-     *                                        are still sitting in the contract until `release()` (or
-     *                                        a dispute) is called - this is the "distinct
-     *                                        delivery-confirmation state" that gates payout.
+     *                                        acknowledge the commission, for the deadline to pass, or
+     *                                        for either party to raise a dispute.
+     *  ORDER_ACKNOWLEDGED                   The artisan has accepted the commission and will work
+     *                                        on it. Waiting for the collector to confirm delivery, for
+     *                                        the deadline to pass, or for either party to raise a
+     *                                        dispute.
+     *  ORDER_DELIVERED                      The collector has confirmed the work actually arrived.
+     *                                        Funds are still sitting in the contract until
+     *                                        `release()` (or a dispute) is called - this is the
+     *                                        "distinct delivery-confirmation state" that gates
+     *                                        payout.
      *  ORDER_FULFILLED                      Terminal. Funds have been paid out to the artisan.
-     *  ORDER_CANCELLED                      Terminal. The artisan backed out before confirming
-     *                                        delivery; funds were refunded to the collector.
+     *  ORDER_CANCELLED                      Terminal. Either party backed out before the artisan
+     *                                        acknowledged the commission; funds were refunded to the
+     *                                        collector.
      *  ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED
-     *                                        Terminal. The deadline passed with no delivery
-     *                                        confirmed and no dispute raised; funds were refunded to
-     *                                        the collector.
+     *                                        Terminal. The deadline passed with delivery still
+     *                                        unconfirmed and no dispute raised; funds were refunded
+     *                                        to the collector.
      *  ORDER_DISPUTED                       Either party disagrees about delivery. Funds are frozen -
      *                                        no release, no refund - until an approved arbiter steps
      *                                        in and calls `resolveDispute()`.
      *  ORDER_DISPUTE_RESOLVED               Terminal. An arbiter decided the dispute; the winning
      *                                        party was paid (minus a 1% arbiter fee) and the losing
      *                                        party got nothing.
+     *
+     * The happy path is strictly linear:
+     *   ORDER_PLACED --acknowledgeCommission()--> ORDER_ACKNOWLEDGED --confirmDelivery()-->
+     *   ORDER_DELIVERED --release()--> ORDER_FULFILLED
      */
     enum Status {
         ORDER_PLACED,
-        ORDER_RECEIVED,
+        ORDER_ACKNOWLEDGED,
+        ORDER_DELIVERED,
         ORDER_FULFILLED,
         ORDER_CANCELLED,
         ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED,
@@ -120,6 +131,48 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
 
     /// @notice The denominator basis-point fees are calculated against (10_000 = 100%).
     uint256 public constant BPS_DENOMINATOR = 10_000;
+
+    // ---------------------------------------------------------------------------------------------
+    // Errors
+    // ---------------------------------------------------------------------------------------------
+    // Custom errors instead of `require(cond, "string")` - reverting with a selector instead of an
+    // ABI-encoded string is meaningfully cheaper on both deployment and call gas, since the compiler
+    // never has to embed/copy the message bytes.
+
+    /// @notice Thrown when a function restricted to the collector is called by anyone else.
+    error NotCollector();
+
+    /// @notice Thrown when a function restricted to the artisan is called by anyone else.
+    error NotArtisan();
+
+    /// @notice Thrown when a function restricted to an approved arbiter is called by anyone else.
+    error NotArbiter();
+
+    /// @notice Thrown when a function restricted to the collector or the artisan is called by a
+    /// third party.
+    error NotPartyToDeal();
+
+    /// @notice Thrown when a function is called while the commission is in the wrong `Status` for
+    /// that action.
+    error InvalidStatus();
+
+    /// @notice Thrown when `initialize` is called with no ETH attached.
+    error NoFundsSent();
+
+    /// @notice Thrown when a required address argument is the zero address.
+    error ZeroAddress();
+
+    /// @notice Thrown when the artisan and collector addresses passed to `initialize` are the same.
+    error ArtisanEqualsCollector();
+
+    /// @notice Thrown when a deadline passed to `initialize` is not in the future.
+    error DeadlineNotInFuture();
+
+    /// @notice Thrown when `refundAfterDeadline` is called before the deadline has passed.
+    error DeadlineNotPassed();
+
+    /// @notice Thrown when a native ETH transfer made by this contract fails.
+    error EthTransferFailed();
 
     // ---------------------------------------------------------------------------------------------
     // Storage
@@ -162,14 +215,18 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     /// @notice Emitted once, inside `initialize`, the moment the collector's payment lands in escrow.
     event CommissionFunded(address indexed collector, address indexed artisan, uint256 amount, uint256 deadline);
 
-    /// @notice Emitted when the artisan marks the commissioned work as delivered.
-    event DeliveryConfirmed(address indexed artisan, uint256 timestamp);
+    /// @notice Emitted when the artisan accepts the commission and commits to working on it.
+    event CommissionAcknowledged(address indexed artisan, uint256 timestamp);
+
+    /// @notice Emitted when the collector confirms the commissioned work actually arrived.
+    event DeliveryConfirmed(address indexed collector, uint256 timestamp);
 
     /// @notice Emitted when funds are finally paid out to the artisan.
     event CommissionReleased(address indexed artisan, uint256 amount);
 
-    /// @notice Emitted when the artisan cancels the commission before confirming delivery.
-    event CommissionCancelled(address indexed artisan, address indexed collector, uint256 refundedAmount);
+    /// @notice Emitted when the commission is cancelled before the artisan acknowledges it.
+    /// `initiator` is whichever party (collector or artisan) called `cancel()`.
+    event CommissionCancelled(address indexed initiator, address indexed collector, uint256 refundedAmount);
 
     /// @notice Emitted when the deadline passes with no delivery confirmed and the collector is
     /// refunded automatically.
@@ -189,13 +246,13 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
 
     /// @dev Restricts a function to the collector who opened this commission.
     modifier onlyCollector() {
-        require(msg.sender == collector, "CommissionEscrow: caller is not the collector");
+        if (msg.sender != collector) revert NotCollector();
         _;
     }
 
     /// @dev Restricts a function to the artisan this commission was created for.
     modifier onlyArtisan() {
-        require(msg.sender == artisan, "CommissionEscrow: caller is not the artisan");
+        if (msg.sender != artisan) revert NotArtisan();
         _;
     }
 
@@ -205,7 +262,14 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     /// arbiter gets there first earn the 1% fee, which is the incentive that keeps disputes from
     /// sitting open forever.
     modifier onlyArbiter() {
-        require(IAccessControl(factory).hasRole(ARBITER_ROLE, msg.sender), "CommissionEscrow: caller is not an arbiter");
+        if (!IAccessControl(factory).hasRole(ARBITER_ROLE, msg.sender)) revert NotArbiter();
+        _;
+    }
+
+    /// @dev Restricts a function to either the collector or the artisan - the two addresses who are
+    /// actually party to this deal. Shared by `cancel()` and `raiseDispute()`.
+    modifier onlyParty() {
+        if (msg.sender != collector && msg.sender != artisan) revert NotPartyToDeal();
         _;
     }
 
@@ -214,7 +278,7 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     /// function runs, it moves `status` to a terminal value, so calling it (or any other
     /// payout function) again will always fail this check.
     modifier inStatus(Status expected) {
-        require(status == expected, "CommissionEscrow: invalid status for this action");
+        if (status != expected) revert InvalidStatus();
         _;
     }
 
@@ -255,11 +319,11 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
         payable
         initializer
     {
-        require(msg.value > 0, "CommissionEscrow: no funds sent");
-        require(_collector != address(0), "CommissionEscrow: collector is the zero address");
-        require(_artisan != address(0), "CommissionEscrow: artisan is the zero address");
-        require(_artisan != _collector, "CommissionEscrow: artisan and collector must differ");
-        require(_deadline > block.timestamp, "CommissionEscrow: deadline must be in the future");
+        if (msg.value == 0) revert NoFundsSent();
+        if (_collector == address(0)) revert ZeroAddress();
+        if (_artisan == address(0)) revert ZeroAddress();
+        if (_artisan == _collector) revert ArtisanEqualsCollector();
+        if (_deadline <= block.timestamp) revert DeadlineNotInFuture();
 
         collector = _collector;
         artisan = _artisan;
@@ -274,61 +338,81 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Happy path: delivery -> release
+    // Happy path: acknowledge -> deliver -> release
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * @notice Called by the artisan to mark the commissioned work as delivered. This is the
-     * "distinct delivery-confirmation state" the funds cannot move without - the collector cannot
-     * skip it, fake it, or call it themselves.
+     * @notice Called by the artisan to accept the commission and commit to working on it.
      * @dev Only callable while the commission is still `ORDER_PLACED`. Moves the commission to
-     * `ORDER_RECEIVED`, one step short of payout. A real deployment would typically have this call
-     * triggered once an off-chain oracle/keeper confirms the shipment's AWB (air waybill) tracking
-     * number shows "delivered" with the carrier; here it is a direct call so the whole lifecycle is
-     * testable without an external oracle dependency.
+     * `ORDER_ACKNOWLEDGED`. This is also the cutoff for `cancel()`: once acknowledged, neither party
+     * can walk away via `cancel()` any more - a dispute is the only way out from here if something
+     * goes wrong.
      */
-    function confirmDelivery() external onlyArtisan inStatus(Status.ORDER_PLACED) {
-        status = Status.ORDER_RECEIVED;
+    function acknowledgeCommission() external onlyArtisan inStatus(Status.ORDER_PLACED) {
+        status = Status.ORDER_ACKNOWLEDGED;
+        emit CommissionAcknowledged(msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Called by the collector to confirm the commissioned work actually arrived. This is the
+     * "distinct delivery-confirmation state" the funds cannot move without.
+     * @dev Deliberately `onlyCollector`, not `onlyArtisan`. If the artisan could confirm their own
+     * delivery, a dishonest artisan could call this (and then `release()`) without ever doing the
+     * work, walking away with the collector's money - exactly the scam this escrow exists to
+     * prevent. The collector is the only party who actually receives the physical goods, so they are
+     * the only one who can truthfully attest that delivery happened. `release()` itself stays open
+     * to anyone precisely because, by the time it is callable, the collector has already vouched for
+     * delivery here.
+     *
+     * Only callable while the commission is `ORDER_ACKNOWLEDGED` (the artisan must have accepted the
+     * commission first). Moves the commission to `ORDER_DELIVERED`, one step short of payout. A real
+     * deployment could additionally gate this on an off-chain oracle/keeper confirming the
+     * shipment's AWB (air waybill) tracking number shows "delivered" before letting the collector
+     * confirm; here it is a direct call so the whole lifecycle is testable without an external
+     * oracle dependency.
+     */
+    function confirmDelivery() external onlyCollector inStatus(Status.ORDER_ACKNOWLEDGED) {
+        status = Status.ORDER_DELIVERED;
         emit DeliveryConfirmed(msg.sender, block.timestamp);
     }
 
     /**
      * @notice Pays the locked commission amount to the artisan. Reachable by anyone (there's nothing
-     * to gain by restricting who can *trigger* the payment), but only once delivery has actually
-     * been confirmed.
+     * to gain by restricting who can *trigger* the payment), but only once the collector has
+     * actually confirmed delivery.
      * @dev Follows Checks-Effects-Interactions: `status` is flipped to the terminal
      * `ORDER_FULFILLED` value *before* the external ETH transfer, and `nonReentrant` blocks any
      * reentrant call for good measure. Together these two mean a malicious `artisan` contract cannot
      * re-enter this function (or any other payout function) to drain the escrow twice.
      */
-    function release() external nonReentrant inStatus(Status.ORDER_RECEIVED) {
+    function release() external nonReentrant inStatus(Status.ORDER_DELIVERED) {
         status = Status.ORDER_FULFILLED;
         uint256 payout = amount;
 
-        (bool success,) = artisan.call{ value: payout }("");
-        require(success, "CommissionEscrow: transfer to artisan failed");
+        _transferETH(artisan, payout);
 
         emit CommissionReleased(artisan, payout);
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Early exit: artisan-initiated cancellation
+    // Early exit: cancellation before acknowledgment
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * @notice Lets the artisan call off a commission they have not yet delivered, refunding the
-     * collector in full. Useful if the artisan realizes they cannot complete the piece.
-     * @dev Only reachable from `ORDER_PLACED` - once delivery has been confirmed the artisan should
-     * be paid via `release()`, not refund the collector.
+     * @notice Lets either the collector or the artisan call off a commission before the artisan has
+     * acknowledged it, refunding the collector in full.
+     * @dev Only reachable from `ORDER_PLACED` - once the artisan acknowledges the commission (moving
+     * status to `ORDER_ACKNOWLEDGED`), this function's `inStatus` guard makes it unreachable for
+     * both parties automatically. From that point on, a dispute is the only way to unwind a
+     * commission that isn't going to be delivered.
      */
-    function cancel() external onlyArtisan nonReentrant inStatus(Status.ORDER_PLACED) {
+    function cancel() external onlyParty nonReentrant inStatus(Status.ORDER_PLACED) {
         status = Status.ORDER_CANCELLED;
         uint256 refundAmount = amount;
 
-        (bool success,) = collector.call{ value: refundAmount }("");
-        require(success, "CommissionEscrow: refund to collector failed");
+        _transferETH(collector, refundAmount);
 
-        emit CommissionCancelled(artisan, collector, refundAmount);
+        emit CommissionCancelled(msg.sender, collector, refundAmount);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -339,19 +423,22 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
      * @notice Returns the locked funds to the collector once the deadline has passed with delivery
      * still unconfirmed. Callable by anyone, so the collector is never dependent on the artisan (or
      * anyone else) cooperating to get their money back.
-     * @dev Only reachable from `ORDER_PLACED`. This is what makes the "no dispute -> no refund"
-     * requirement automatic rather than something we have to special-case: once a dispute is raised
-     * the status moves to `ORDER_DISPUTED`, so `inStatus(Status.ORDER_PLACED)` below will already
-     * fail on its own - there is no separate "is this disputed" check needed.
+     * @dev Reachable from `ORDER_PLACED` (artisan never even acknowledged) or `ORDER_ACKNOWLEDGED`
+     * (artisan accepted but the collector never got to confirm delivery) - i.e. any state where
+     * delivery has not yet been confirmed. Not reachable from `ORDER_DELIVERED` (the artisan should
+     * be paid via `release()` at that point, not refunded) or `ORDER_DISPUTED` (which is what makes
+     * the "no dispute -> no refund" requirement automatic: once a dispute is raised, `status` moves
+     * to `ORDER_DISPUTED`, a value this function's allow-list below simply does not include, so no
+     * separate "is this disputed" check is needed).
      */
-    function refundAfterDeadline() external nonReentrant inStatus(Status.ORDER_PLACED) {
-        require(block.timestamp > deadline, "CommissionEscrow: deadline has not passed yet");
+    function refundAfterDeadline() external nonReentrant {
+        if (status != Status.ORDER_PLACED && status != Status.ORDER_ACKNOWLEDGED) revert InvalidStatus();
+        if (block.timestamp <= deadline) revert DeadlineNotPassed();
 
         status = Status.ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED;
         uint256 refundAmount = amount;
 
-        (bool success,) = collector.call{ value: refundAmount }("");
-        require(success, "CommissionEscrow: refund to collector failed");
+        _transferETH(collector, refundAmount);
 
         emit CommissionRefunded(collector, refundAmount);
     }
@@ -363,20 +450,18 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     /**
      * @notice Lets either the collector or the artisan flag that they disagree about whether the
      * work was actually delivered. Freezes the commission so neither `release()` nor
-     * `refundAfterDeadline()` (nor `cancel()`) can move funds until an arbiter steps in.
+     * `refundAfterDeadline()` (nor `cancel()`, which is already unreachable past `ORDER_PLACED`) can
+     * move funds until an arbiter steps in.
      * @dev Reachable from `ORDER_PLACED` (e.g. the collector believes the artisan will never
-     * deliver) or `ORDER_RECEIVED` (e.g. the artisan claims delivery but the collector says the
-     * package never arrived, or arrived empty). Also registers this commission with the factory's
-     * public "disputed commissions" list so any approved arbiter can find and resolve it.
+     * deliver), `ORDER_ACKNOWLEDGED` (e.g. the artisan accepted but has gone silent), or
+     * `ORDER_DELIVERED` (e.g. the collector says the confirmation was premature, or the artisan says
+     * the collector is refusing to confirm in bad faith). Also registers this commission with the
+     * factory's public "disputed commissions" list so any approved arbiter can find and resolve it.
      */
-    function raiseDispute() external {
-        require(
-            msg.sender == collector || msg.sender == artisan, "CommissionEscrow: caller is not a party to this deal"
-        );
-        require(
-            status == Status.ORDER_PLACED || status == Status.ORDER_RECEIVED,
-            "CommissionEscrow: commission cannot be disputed in its current status"
-        );
+    function raiseDispute() external onlyParty {
+        if (status != Status.ORDER_PLACED && status != Status.ORDER_ACKNOWLEDGED && status != Status.ORDER_DELIVERED) {
+            revert InvalidStatus();
+        }
 
         status = Status.ORDER_DISPUTED;
         disputeInitiator = msg.sender;
@@ -395,6 +480,31 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
      * whichever side the arbiter decided should receive it. Follows Checks-Effects-Interactions:
      * `status` moves to the terminal `ORDER_DISPUTE_RESOLVED` value, and this commission is removed
      * from the factory's disputed-commissions list, before either ETH transfer is attempted.
+     *
+     * WHY `releaseToArtisan` IS A FUNCTION PARAMETER, NOT SOMETHING READ FROM STORAGE:
+     * There is no on-chain fact this contract could look up that would tell it whether the
+     * collector's physical painting actually arrived - that is precisely the real-world question the
+     * two parties disagree about, and precisely why a human arbiter is needed at all. If the answer
+     * were derivable from contract storage, there would be nothing to dispute: the contract could
+     * simply resolve itself. `releaseToArtisan` is not an input the contract trusts blindly - it *is*
+     * the arbiter's verdict, which by definition cannot exist anywhere before the arbiter renders it.
+     *
+     * WHAT STOPS A COLLUDING ARBITER FROM LYING: nothing at the smart-contract level can force an
+     * arbiter to tell the truth - that is an inherent limitation of trusting a single third party to
+     * arbitrate, not a bug specific to this function. What this design *does* provide:
+     *   - Every resolution is permanently, publicly logged via {DisputeResolved}, including the
+     *     arbiter's own address and their exact verdict - a colluding arbiter cannot act
+     *     anonymously or deniably.
+     *   - `ARBITER_ROLE` is revocable at any time by the factory's `DEFAULT_ADMIN_ROLE` holder
+     *     (`CommissionEscrowFactory.revokeRole`), so a caught-out arbiter can be removed from all
+     *     future disputes immediately.
+     *   - The original project brief explicitly treats "an arbiter, multisig, or DAO" as
+     *     interchangeable resolution mechanisms and leaves the exact choice to the implementer. A
+     *     single approved address is the simplest version of that spectrum; requiring several
+     *     independent `ARBITER_ROLE` holders to agree (N-of-M voting) before funds move would raise
+     *     the cost of collusion considerably and is the natural next step - tracked as a future-scope
+     *     item in the README rather than built here, to keep this contract's trust model explicit
+     *     and easy to reason about today.
      * @param releaseToArtisan Pass `true` if the arbiter decided delivery genuinely happened (pay
      * the artisan); pass `false` if the arbiter sided with the collector (refund the collector).
      */
@@ -407,12 +517,25 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
         uint256 partyPayout = totalAmount - arbiterFee;
         address recipient = releaseToArtisan ? artisan : collector;
 
-        (bool feePaid,) = msg.sender.call{ value: arbiterFee }("");
-        require(feePaid, "CommissionEscrow: arbiter fee transfer failed");
-
-        (bool partyPaid,) = recipient.call{ value: partyPayout }("");
-        require(partyPaid, "CommissionEscrow: payout to resolved party failed");
+        _transferETH(msg.sender, arbiterFee);
+        _transferETH(recipient, partyPayout);
 
         emit DisputeResolved(msg.sender, releaseToArtisan, arbiterFee, partyPayout, recipient);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Internal helpers
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * @dev Sends `value` wei of native ETH to `to`, reverting with {EthTransferFailed} on failure.
+     * Every function above that moves funds out of this contract already updates `status` (its
+     * "effect") before calling this helper (the "interaction"), so extracting the repeated
+     * call-and-check into one place is a pure deduplication - it does not change
+     * Checks-Effects-Interactions ordering at any call site.
+     */
+    function _transferETH(address to, uint256 value) private {
+        (bool success,) = to.call{ value: value }("");
+        if (!success) revert EthTransferFailed();
     }
 }

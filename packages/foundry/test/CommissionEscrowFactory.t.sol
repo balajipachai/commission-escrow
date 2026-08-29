@@ -26,7 +26,10 @@ contract CommissionEscrowFactoryTest is Test {
     uint256 internal deadline;
 
     function setUp() public {
-        factory = new CommissionEscrowFactory(admin);
+        // `admin` is passed as both the admin and the initial arbiter here purely for test
+        // convenience - see test_ConstructorGrantsDistinctRolesToDistinctAddresses below for
+        // coverage of the two parameters actually being independent.
+        factory = new CommissionEscrowFactory(admin, admin);
         deadline = block.timestamp + 7 days;
         vm.deal(collector, 100 ether);
     }
@@ -36,9 +39,26 @@ contract CommissionEscrowFactoryTest is Test {
         assertTrue(factory.hasRole(factory.ARBITER_ROLE(), admin));
     }
 
+    /// @notice The constructor's `admin` and `arbiter` parameters are independent: passing distinct
+    /// addresses must grant each address only its own role, not both roles to both addresses.
+    function test_ConstructorGrantsDistinctRolesToDistinctAddresses() public {
+        CommissionEscrowFactory distinctFactory = new CommissionEscrowFactory(admin, arbiter);
+
+        assertTrue(distinctFactory.hasRole(distinctFactory.DEFAULT_ADMIN_ROLE(), admin));
+        assertFalse(distinctFactory.hasRole(distinctFactory.ARBITER_ROLE(), admin));
+
+        assertTrue(distinctFactory.hasRole(distinctFactory.ARBITER_ROLE(), arbiter));
+        assertFalse(distinctFactory.hasRole(distinctFactory.DEFAULT_ADMIN_ROLE(), arbiter));
+    }
+
     function test_RevertWhen_ConstructorGivenZeroAddressAdmin() public {
-        vm.expectRevert("CommissionEscrowFactory: admin is the zero address");
-        new CommissionEscrowFactory(address(0));
+        vm.expectRevert(CommissionEscrowFactory.ZeroAddress.selector);
+        new CommissionEscrowFactory(address(0), arbiter);
+    }
+
+    function test_RevertWhen_ConstructorGivenZeroAddressArbiter() public {
+        vm.expectRevert(CommissionEscrowFactory.ZeroAddress.selector);
+        new CommissionEscrowFactory(admin, address(0));
     }
 
     function test_RevertWhen_NonAdminGrantsArbiterRole() public {
@@ -95,13 +115,13 @@ contract CommissionEscrowFactoryTest is Test {
 
     function test_RevertWhen_StrangerCallsNotifyDisputedDirectly() public {
         vm.prank(stranger);
-        vm.expectRevert("CommissionEscrowFactory: caller is not a commission created by this factory");
+        vm.expectRevert(CommissionEscrowFactory.NotGenuineCommission.selector);
         factory.notifyDisputed(stranger);
     }
 
     function test_RevertWhen_StrangerCallsNotifyDisputeSettledDirectly() public {
         vm.prank(stranger);
-        vm.expectRevert("CommissionEscrowFactory: caller is not a commission created by this factory");
+        vm.expectRevert(CommissionEscrowFactory.NotGenuineCommission.selector);
         factory.notifyDisputeSettled(stranger);
     }
 

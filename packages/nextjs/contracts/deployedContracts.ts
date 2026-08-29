@@ -7,13 +7,18 @@ import { GenericContractsDeclaration } from "~~/utils/scaffold-eth/contract";
 const deployedContracts = {
   31337: {
     CommissionEscrowFactory: {
-      address: "0x700b6a60ce7eaaea56f065753d8dcb9653dbad35",
+      address: "0xb19b36b1456e65e3a6d514d3f715f204bd59f431",
       abi: [
         {
           type: "constructor",
           inputs: [
             {
               name: "admin",
+              type: "address",
+              internalType: "address",
+            },
+            {
+              name: "arbiter",
               type: "address",
               internalType: "address",
             },
@@ -542,6 +547,11 @@ const deployedContracts = {
         },
         {
           type: "error",
+          name: "AlreadyDisputed",
+          inputs: [],
+        },
+        {
+          type: "error",
           name: "FailedDeployment",
           inputs: [],
         },
@@ -561,9 +571,29 @@ const deployedContracts = {
             },
           ],
         },
+        {
+          type: "error",
+          name: "NoCommissionAmountSent",
+          inputs: [],
+        },
+        {
+          type: "error",
+          name: "NotGenuineCommission",
+          inputs: [],
+        },
+        {
+          type: "error",
+          name: "NotListedAsDisputed",
+          inputs: [],
+        },
+        {
+          type: "error",
+          name: "ZeroAddress",
+          inputs: [],
+        },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 1,
+      deployedOnBlock: 3,
     },
   },
 } as const;

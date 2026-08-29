@@ -11,9 +11,12 @@ import { CommissionEscrowFactory } from "../contracts/CommissionEscrowFactory.so
  *      - Includes ScaffoldEthDeployerRunner modifier
  *      - Provides `deployer` variable
  *
- * The `deployer` account is granted both `DEFAULT_ADMIN_ROLE` (so it can grant/revoke
- * `ARBITER_ROLE` for other addresses later) and `ARBITER_ROLE` itself (so there is at least one
- * working arbiter as soon as the factory is live) - see the factory's constructor.
+ * The `deployer` account is always granted `DEFAULT_ADMIN_ROLE` (so it can grant/revoke
+ * `ARBITER_ROLE` for other addresses later). `ARBITER_ROLE` itself goes to whatever address is set
+ * in the `INITIAL_ARBITER` environment variable, or falls back to `deployer` if that variable is
+ * unset - so there is always at least one working arbiter as soon as the factory is live, but a
+ * real deployment can hand day-to-day dispute resolution to a separate address (e.g. a multisig)
+ * from the start. See the factory's constructor.
  *
  * Example:
  * yarn deploy --file DeployCommissionEscrowFactory.s.sol            # local anvil chain
@@ -30,6 +33,7 @@ contract DeployCommissionEscrowFactory is ScaffoldETHDeploy {
      *      - Export contract addresses & ABIs to the `nextjs` package
      */
     function run() external ScaffoldEthDeployerRunner {
-        new CommissionEscrowFactory(deployer);
+        address initialArbiter = vm.envOr("INITIAL_ARBITER", deployer);
+        new CommissionEscrowFactory(deployer, initialArbiter);
     }
 }
