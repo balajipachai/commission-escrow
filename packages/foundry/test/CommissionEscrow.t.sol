@@ -22,6 +22,9 @@ contract CommissionEscrowTest is Test {
     address internal arbiter = makeAddr("arbiter");
     address internal stranger = makeAddr("stranger");
 
+    // `COMMISSION_PRICE` here is the total ETH locked at creation - 120% of the true commission
+    // price (100% price + the collector's 20% refundable confirmation deposit). Use
+    // `escrow.commissionPrice()` / `escrow.collectorDeposit()` when a test needs the split.
     uint256 internal constant COMMISSION_PRICE = 2 ether;
     uint256 internal deadline;
 
@@ -59,10 +62,23 @@ contract CommissionEscrowTest is Test {
         escrow.acknowledgeCommission();
     }
 
-    /// @dev Helper: walks a fresh commission all the way to ORDER_DELIVERED (artisan acknowledges,
-    /// then collector confirms delivery), the prerequisite state for `release()`.
-    function _acknowledgeAndConfirmDelivery(CommissionEscrow escrow) internal {
+    /// @dev Helper: artisan marks the (already acknowledged) commission as shipped.
+    function _ship(CommissionEscrow escrow) internal {
+        vm.prank(artisan);
+        escrow.orderShipped();
+    }
+
+    /// @dev Helper: artisan acknowledges then ships, moving a fresh commission to ORDER_SHIPPED.
+    function _acknowledgeAndShip(CommissionEscrow escrow) internal {
         _acknowledge(escrow);
+        _ship(escrow);
+    }
+
+    /// @dev Helper: walks a fresh commission all the way to ORDER_DELIVERED (artisan acknowledges,
+    /// artisan ships, collector confirms delivery before the deadline), the prerequisite state for
+    /// `release()`.
+    function _fullyDeliver(CommissionEscrow escrow) internal {
+        _acknowledgeAndShip(escrow);
         vm.prank(collector);
         escrow.confirmDelivery();
     }
@@ -93,6 +109,21 @@ contract CommissionEscrowTest is Test {
         // CommissionEscrow.initialize() has no separate "amount" parameter at all - `amount` is always
         // `msg.value` from the funding call, so this is the only way it could ever be set.
         assertEq(escrow.amount(), COMMISSION_PRICE);
+    }
+
+    function test_CommissionPriceAndCollectorDepositSplitTheLockedAmount() public {
+        CommissionEscrow escrow = _createCommission();
+
+        uint256 price = escrow.commissionPrice();
+        uint256 deposit = escrow.collectorDeposit();
+
+        // The two must always sum to exactly the locked amount, with no rounding dust left behind.
+        assertEq(price + deposit, COMMISSION_PRICE);
+        // The deposit is ~20% of the price (i.e. price is ~5x the deposit) - integer division on a
+        // COMMISSION_PRICE that isn't a clean multiple of 12 leaves a few wei of rounding, which
+        // `commissionPrice()`'s floor() division always resolves in the collector's favor (their
+        // deposit absorbs the remainder), so allow a small absolute tolerance here.
+        assertApproxEqAbs(deposit * 5, price, 10);
     }
 
     function test_RevertWhen_ImplementationInitializedDirectly() public {
@@ -129,8 +160,42 @@ contract CommissionEscrowTest is Test {
         escrow.acknowledgeCommission();
     }
 
+    function test_ArtisanCanShipAfterAcknowledging() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledge(escrow);
+
+        _ship(escrow);
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_SHIPPED));
+    }
+
+    function test_RevertWhen_OrderShippedBeforeAcknowledgement() public {
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(artisan);
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
+        escrow.orderShipped();
+    }
+
+    function test_RevertWhen_CollectorShipsOrder() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledge(escrow);
+
+        vm.prank(collector);
+        vm.expectRevert(CommissionEscrow.NotArtisan.selector);
+        escrow.orderShipped();
+    }
+
     function test_RevertWhen_ConfirmDeliveryBeforeAcknowledgement() public {
         CommissionEscrow escrow = _createCommission();
+        vm.prank(collector);
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
+        escrow.confirmDelivery();
+    }
+
+    function test_RevertWhen_ConfirmDeliveryBeforeShipping() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledge(escrow);
+
         vm.prank(collector);
         vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.confirmDelivery();
@@ -146,10 +211,10 @@ contract CommissionEscrowTest is Test {
     /// `confirmDelivery()` was `onlyArtisan`, which meant a dishonest artisan could confirm their
     /// own "delivery" and walk away with `release()` without ever doing the work. Now that
     /// `confirmDelivery()` is `onlyCollector`, the artisan calling it - even after legitimately
-    /// acknowledging the commission - must revert.
+    /// acknowledging and shipping the commission - must revert.
     function test_RevertWhen_ArtisanConfirmsOwnDelivery() public {
         CommissionEscrow escrow = _createCommission();
-        _acknowledge(escrow);
+        _acknowledgeAndShip(escrow);
 
         vm.prank(artisan);
         vm.expectRevert(CommissionEscrow.NotCollector.selector);
@@ -163,21 +228,46 @@ contract CommissionEscrowTest is Test {
         escrow.confirmDelivery();
     }
 
-    function test_ReleaseSucceedsOnlyAfterCollectorConfirmsDelivery() public {
+    /// @notice This is the regression test for the "what stops the collector from just never
+    /// confirming" gap: once the artisan has shipped, the collector has exactly until `deadline` to
+    /// call `confirmDelivery()`. After that, the function is permanently blocked and the artisan's
+    /// only recourse is `raiseDispute()`.
+    function test_RevertWhen_ConfirmDeliveryAfterDeadline() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledgeAndShip(escrow);
+
+        vm.warp(deadline + 1);
+
+        vm.prank(collector);
+        vm.expectRevert(CommissionEscrow.DeadlineAlreadyPassed.selector);
+        escrow.confirmDelivery();
+    }
+
+    function test_ReleaseSucceedsOnlyAfterCollectorConfirmsDeliveryOnTime() public {
         CommissionEscrow escrow = _createCommission();
 
         _acknowledge(escrow);
         assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_ACKNOWLEDGED));
 
+        _ship(escrow);
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_SHIPPED));
+
         vm.prank(collector);
         escrow.confirmDelivery();
         assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DELIVERED));
 
+        uint256 expectedPrice = escrow.commissionPrice();
+        uint256 expectedDeposit = escrow.collectorDeposit();
         uint256 artisanBalanceBefore = artisan.balance;
+        uint256 collectorBalanceBefore = collector.balance;
+
         escrow.release();
 
         assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_FULFILLED));
-        assertEq(artisan.balance, artisanBalanceBefore + COMMISSION_PRICE);
+        assertEq(artisan.balance, artisanBalanceBefore + expectedPrice, "artisan should receive the 100% price");
+        assertEq(
+            collector.balance, collectorBalanceBefore + expectedDeposit, "collector should get their 20% deposit back"
+        );
         assertEq(address(escrow).balance, 0);
     }
 
@@ -193,11 +283,17 @@ contract CommissionEscrowTest is Test {
         CommissionEscrow escrow = CommissionEscrow(payable(commission));
         malicious.setEscrow(escrow);
 
-        vm.prank(address(malicious));
+        vm.startPrank(address(malicious));
         escrow.acknowledgeCommission();
+        escrow.orderShipped();
+        vm.stopPrank();
 
         vm.prank(collector);
         escrow.confirmDelivery();
+
+        uint256 expectedPrice = escrow.commissionPrice();
+        uint256 expectedDeposit = escrow.collectorDeposit();
+        uint256 collectorBalanceBefore = collector.balance;
 
         // This call must succeed exactly once. Inside it, `malicious.receive()` tries to call
         // `release()` again - that reentrant call must fail (status is already ORDER_FULFILLED and
@@ -206,7 +302,10 @@ contract CommissionEscrowTest is Test {
 
         assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_FULFILLED));
         assertEq(address(escrow).balance, 0, "escrow must not be drained twice");
-        assertEq(address(malicious).balance, COMMISSION_PRICE, "artisan should still receive exactly one payout");
+        assertEq(address(malicious).balance, expectedPrice, "artisan should still receive exactly one payout");
+        assertEq(
+            collector.balance, collectorBalanceBefore + expectedDeposit, "collector should still get their deposit back"
+        );
         assertTrue(malicious.reentrancyAttempted(), "the mock should have actually attempted reentrancy");
         assertFalse(malicious.reentrancySucceeded(), "the reentrant call must have failed");
     }
@@ -245,9 +344,22 @@ contract CommissionEscrowTest is Test {
         assertEq(collector.balance, collectorBalanceBefore + COMMISSION_PRICE);
     }
 
+    /// @notice Once the artisan has shipped, a missed deadline is presumptively the *collector's*
+    /// fault for not confirming - so self-serve refund must stop working here. Otherwise a silent
+    /// collector could simply refund themselves the instant the deadline passes, before the artisan
+    /// gets a chance to dispute, defeating the whole confirmation-deposit mechanism.
+    function test_RevertWhen_RefundAttemptedAfterShipped() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledgeAndShip(escrow);
+
+        vm.warp(deadline + 1);
+        vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
+        escrow.refundAfterDeadline();
+    }
+
     function test_RevertWhen_RefundAttemptedAfterDeliveryConfirmed() public {
         CommissionEscrow escrow = _createCommission();
-        _acknowledgeAndConfirmDelivery(escrow);
+        _fullyDeliver(escrow);
 
         vm.warp(deadline + 1);
         vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
@@ -271,7 +383,7 @@ contract CommissionEscrowTest is Test {
 
     function test_RevertWhen_CollectorResolvesOwnDispute() public {
         CommissionEscrow escrow = _createCommission();
-        _acknowledgeAndConfirmDelivery(escrow);
+        _fullyDeliver(escrow);
         vm.prank(collector);
         escrow.raiseDispute();
 
@@ -308,11 +420,56 @@ contract CommissionEscrowTest is Test {
         assertEq(factory.getDisputedCommissions().length, 1);
     }
 
+    function test_RaiseDisputeReachableFromShippedStatus() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledgeAndShip(escrow);
+
+        vm.prank(artisan);
+        escrow.raiseDispute();
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTED));
+    }
+
+    /// @notice The key end-to-end proof of the confirmation-deposit "punishment" mechanism: the
+    /// artisan ships, the collector lets the deadline pass without confirming, the artisan disputes,
+    /// and the arbiter sides with the artisan. The artisan must receive the *entire* 120% locked
+    /// amount (minus the arbiter's 1% fee) - not just the 100% price - with no special-cased
+    /// "forfeited deposit" logic required anywhere: `resolveDispute` already splits the full `amount`.
+    function test_ArbiterAwardsFullAmountToArtisanWhenCollectorMissesConfirmationDeadline() public {
+        _grantArbiterRole(arbiter);
+
+        CommissionEscrow escrow = _createCommission();
+        _acknowledgeAndShip(escrow);
+        vm.warp(deadline + 1);
+
+        vm.prank(artisan);
+        escrow.raiseDispute();
+
+        uint256 arbiterFee = (COMMISSION_PRICE * escrow.ARBITER_FEE_BPS()) / escrow.BPS_DENOMINATOR();
+        uint256 expectedArtisanPayout = COMMISSION_PRICE - arbiterFee;
+        uint256 artisanBalanceBefore = artisan.balance;
+
+        vm.prank(arbiter);
+        escrow.resolveDispute(true);
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTE_RESOLVED));
+        assertEq(
+            artisan.balance,
+            artisanBalanceBefore + expectedArtisanPayout,
+            "artisan should receive the full 120% (minus the arbiter fee), including the forfeited deposit"
+        );
+        assertGt(
+            expectedArtisanPayout,
+            escrow.commissionPrice(),
+            "payout must exceed the bare price - the deposit was forfeited too"
+        );
+    }
+
     function test_ApprovedArbiterResolvesDisputeInFavorOfArtisan() public {
         _grantArbiterRole(arbiter);
 
         CommissionEscrow escrow = _createCommission();
-        _acknowledgeAndConfirmDelivery(escrow);
+        _fullyDeliver(escrow);
         vm.prank(collector);
         escrow.raiseDispute();
 
@@ -362,7 +519,7 @@ contract CommissionEscrowTest is Test {
 
     function test_RevertWhen_ReleaseCalledTwice() public {
         CommissionEscrow escrow = _createCommission();
-        _acknowledgeAndConfirmDelivery(escrow);
+        _fullyDeliver(escrow);
         escrow.release();
 
         vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
@@ -403,7 +560,7 @@ contract CommissionEscrowTest is Test {
     }
 
     // =================================================================================================
-    // Cancellation (ORDER_CANCELLED) - either party, only before acknowledgment
+    // Cancellation (ORDER_CANCELLED) - either party, only before shipping
     // =================================================================================================
 
     function test_ArtisanCancelRefundsCollector() public {
@@ -437,18 +594,42 @@ contract CommissionEscrowTest is Test {
         escrow.cancel();
     }
 
-    function test_RevertWhen_ArtisanCancelsAfterAcknowledgement() public {
+    function test_ArtisanCancelSucceedsAfterAcknowledgement() public {
         CommissionEscrow escrow = _createCommission();
         _acknowledge(escrow);
+        uint256 collectorBalanceBefore = collector.balance;
+
+        vm.prank(artisan);
+        escrow.cancel();
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_CANCELLED));
+        assertEq(collector.balance, collectorBalanceBefore + COMMISSION_PRICE);
+    }
+
+    function test_CollectorCancelSucceedsAfterAcknowledgement() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledge(escrow);
+        uint256 collectorBalanceBefore = collector.balance;
+
+        vm.prank(collector);
+        escrow.cancel();
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_CANCELLED));
+        assertEq(collector.balance, collectorBalanceBefore + COMMISSION_PRICE);
+    }
+
+    function test_RevertWhen_ArtisanCancelsAfterShipping() public {
+        CommissionEscrow escrow = _createCommission();
+        _acknowledgeAndShip(escrow);
 
         vm.prank(artisan);
         vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
         escrow.cancel();
     }
 
-    function test_RevertWhen_CollectorCancelsAfterAcknowledgement() public {
+    function test_RevertWhen_CollectorCancelsAfterShipping() public {
         CommissionEscrow escrow = _createCommission();
-        _acknowledge(escrow);
+        _acknowledgeAndShip(escrow);
 
         vm.prank(collector);
         vm.expectRevert(CommissionEscrow.InvalidStatus.selector);

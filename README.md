@@ -5,15 +5,18 @@ wants to commission a piece. Neither wants to trust a middleman with the money: 
 payment should be **locked on-chain the moment the deal is struck**, **released to the artisan
 only once delivery is confirmed**, **returned automatically to the collector if the deadline
 passes with nothing delivered**, and **frozen until a neutral arbiter decides** if the two of them
-disagree.
+disagree. And it has to protect both sides symmetrically: the artisan can't fake their own
+delivery to grab the money, and the collector can't just go silent forever once the work has
+shipped — see [The 20% confirmation deposit](#the-20-confirmation-deposit) below for how that
+second problem is solved.
 
 This repo is exactly that, built with [Scaffold-ETH 2](https://scaffoldeth.io) (Foundry + Next.js /
 wagmi / viem), targeting Base Sepolia.
 
 ```
-Collector ──funds──▶  CommissionEscrow  ──releases on delivery──▶  Artisan
-                       (one per deal)   ──refunds on timeout────▶  Collector
-                                        ──splits on dispute─────▶  winner + 1% to the Arbiter
+Collector ──funds (120%)──▶  CommissionEscrow  ──on-time delivery──▶  100% to Artisan, 20% back to Collector
+                              (one per deal)    ──refunds on timeout (pre-shipping)──▶  120% to Collector
+                                                 ──splits on dispute─────▶  120% (minus 1% fee) to the winner
 ```
 
 ## What's actually in here
@@ -26,10 +29,11 @@ Collector ──funds──▶  CommissionEscrow  ──releases on delivery─�
   list of every commission currently in dispute — the "marketplace" any approved arbiter can pick
   work from.
 - **`CommissionEscrow.sol`** — the escrow logic itself, one instance per commission. Handles
-  funding, delivery confirmation, payout, timeout refunds, early cancellation, and dispute
+  funding, artisan acknowledgment/shipping, collector delivery confirmation (with a refundable
+  confirmation deposit — see below), payout, timeout refunds, early cancellation, and dispute
   resolution. Uses OpenZeppelin's `ReentrancyGuard` and the Checks-Effects-Interactions pattern
   throughout, so state is always finalized before any ETH leaves the contract.
-- **`packages/foundry/test/`** — 45 Foundry tests covering the full lifecycle (see [Running the
+- **`packages/foundry/test/`** — 56 Foundry tests covering the full lifecycle (see [Running the
   tests](#running-the-tests) below).
 - **`packages/nextjs/`** — the stock Scaffold-ETH 2 frontend. No custom pages were built for this
   challenge; the built-in **Debug Contracts** page is enough to fund, confirm, release, dispute and
@@ -103,24 +107,35 @@ button to fund them with test ETH.
 A full happy-path walkthrough:
 
 1. **As the collector**, open `CommissionEscrowFactory` → `createCommission`, fill in the
-   artisan's address, a future Unix timestamp for `deadline`, attach some ETH as the payable value,
-   and send it. Copy the returned commission address (or read it back via `getAllCommissions`).
+   artisan's address, a future Unix timestamp for `deadline`, attach **120% of the agreed price**
+   as the payable value (the extra 20% is the collector's refundable confirmation deposit — see
+   [below](#the-20-confirmation-deposit)), and send it. Copy the returned commission address (or
+   read it back via `getAllCommissions`).
 2. Paste that address into the **"Read/Write custom contract"** section of `/debug` using the
    `CommissionEscrow` ABI (or just add its address under `getCommissionsByArtisan` /
    `getCommissionsByCollector` results) to interact with that specific commission.
-3. **As the artisan** (switch burner wallet), call `acknowledgeCommission()` to accept the job.
-4. **As the collector** (switch burner wallet back), call `confirmDelivery()` once the work has
-   actually arrived — this is the step that closes the "artisan pays themselves" loophole, since
-   only the collector can attest that delivery really happened.
-5. Anyone can now call `release()` — the artisan receives the full amount.
+3. **As the artisan** (switch burner wallet), call `acknowledgeCommission()` to accept the job,
+   then `orderShipped()` once the work is on its way.
+4. **As the collector** (switch burner wallet back), call `confirmDelivery()` — **before the
+   deadline** — once the work has actually arrived. This is the step that closes the "artisan pays
+   themselves" loophole, since only the collector can attest that delivery really happened.
+5. Anyone can now call `release()` — the artisan receives the 100% commission price, and the
+   collector automatically gets their 20% deposit back in the same transaction.
 6. To see the dispute path instead: at any point before release, **as the collector or artisan**,
    call `raiseDispute()`. As the deployer (who holds `ARBITER_ROLE` unless you configured a
-   different `INITIAL_ARBITER`), call `resolveDispute(true)` (pay the artisan) or
-   `resolveDispute(false)` (refund the collector) — the resolving address always keeps a 1% fee.
-7. To see the timeout path: let the `deadline` you chose pass while still in `ORDER_PLACED` or
-   `ORDER_ACKNOWLEDGED`, then call `refundAfterDeadline()` — the collector gets their money back
-   automatically. If a dispute is open, or delivery has already been confirmed, this reverts
-   instead, exactly as intended.
+   different `INITIAL_ARBITER`), call `resolveDispute(true)` (pay the artisan the full 120%) or
+   `resolveDispute(false)` (refund the collector the full 120%) — the resolving address always
+   keeps a 1% fee off the top.
+7. To see the "collector goes silent" punishment path: after step 3's `orderShipped()`, let the
+   `deadline` pass **without** calling `confirmDelivery()` — trying to call it now reverts. As the
+   artisan, call `raiseDispute()`, then resolve in the artisan's favor as the arbiter — the artisan
+   receives the *entire* 120% (minus the 1% fee), deposit included, as the penalty for the
+   collector's silence.
+8. To see the plain timeout path instead: let the `deadline` pass while still in `ORDER_PLACED` or
+   `ORDER_ACKNOWLEDGED` (i.e. the artisan never shipped), then call `refundAfterDeadline()` — the
+   collector gets their full 120% back automatically, no dispute needed, since the failure here is
+   the artisan's. This self-serve refund stops working the moment the artisan ships (see the
+   `refundAfterDeadline()` NatSpec for why).
 
 ## Running the tests
 
@@ -130,13 +145,13 @@ yarn foundry:test
 forge test -vv
 ```
 
-34 tests across two files, one function per numbered requirement (see comments in the test files
+56 tests across two files, one function per numbered requirement (see comments in the test files
 for the exact mapping):
 
 | # | Requirement | Covered in |
 |---|---|---|
 | 1 | Escrow holds funds before work begins | `CommissionEscrow.t.sol` — `test_EscrowHoldsFundsAtCreation` |
-| 2 | Release requires confirmed delivery | `test_RevertWhen_ReleaseCalledBeforeDeliveryConfirmed`, `test_RevertWhen_ArtisanConfirmsOwnDelivery` (the artisan cannot fake their own delivery), `test_ReleaseSucceedsOnlyAfterCollectorConfirmsDelivery` |
+| 2 | Release requires confirmed delivery | `test_RevertWhen_ReleaseCalledBeforeDeliveryConfirmed`, `test_RevertWhen_ArtisanConfirmsOwnDelivery` (the artisan cannot fake their own delivery), `test_RevertWhen_ConfirmDeliveryAfterDeadline` (the collector can't stall forever either), `test_ReleaseSucceedsOnlyAfterCollectorConfirmsDeliveryOnTime` |
 | 3 | State updated before external transfer | `test_RevertWhen_MaliciousArtisanReentersOnRelease` (a hostile artisan contract tries to re-enter `release()` from its `receive()` hook) |
 | 4 | Timeout produces an explicit refund path | `test_RefundAfterDeadlineReturnsFundsToCollector`, `test_RevertWhen_RefundAttemptedOnDisputedCommissionAfterDeadline` |
 | 5 | Disputes aren't resolved by either party alone | `test_RevertWhen_CollectorResolvesOwnDispute`, `test_RevertWhen_ArtisanResolvesOwnDispute`, `test_ApprovedArbiterResolvesDisputeInFavorOfArtisan` |
@@ -151,17 +166,20 @@ arbiter roster, and the disputed-commissions "marketplace" list lifecycle.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> ORDER_PLACED: createCommission()\n(funds locked)
+    [*] --> ORDER_PLACED: createCommission()\n(120% locked)
     ORDER_PLACED --> ORDER_ACKNOWLEDGED: acknowledgeCommission()\n[artisan only]
-    ORDER_ACKNOWLEDGED --> ORDER_DELIVERED: confirmDelivery()\n[collector only]
-    ORDER_DELIVERED --> ORDER_FULFILLED: release()\n(anyone can trigger)
+    ORDER_ACKNOWLEDGED --> ORDER_SHIPPED: orderShipped()\n[artisan only]
+    ORDER_SHIPPED --> ORDER_DELIVERED: confirmDelivery()\n[collector only, before deadline]
+    ORDER_DELIVERED --> ORDER_FULFILLED: release()\n(100% to artisan, 20% back to collector)
     ORDER_PLACED --> ORDER_CANCELLED: cancel()\n[collector or artisan]
+    ORDER_ACKNOWLEDGED --> ORDER_CANCELLED: cancel()\n[collector or artisan]
     ORDER_PLACED --> ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED: refundAfterDeadline()\n[deadline passed]
     ORDER_ACKNOWLEDGED --> ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED: refundAfterDeadline()\n[deadline passed]
     ORDER_PLACED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
     ORDER_ACKNOWLEDGED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
+    ORDER_SHIPPED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
     ORDER_DELIVERED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
-    ORDER_DISPUTED --> ORDER_DISPUTE_RESOLVED: resolveDispute()\n[arbiter only, 1% fee]
+    ORDER_DISPUTED --> ORDER_DISPUTE_RESOLVED: resolveDispute()\n[arbiter only, 120% minus 1% fee]
     ORDER_FULFILLED --> [*]
     ORDER_CANCELLED --> [*]
     ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED --> [*]
@@ -171,25 +189,53 @@ stateDiagram-v2
 Every arrow above corresponds to exactly one function in `CommissionEscrow.sol`. Note `confirmDelivery()`
 is deliberately `[collector only]`, not artisan — if the artisan could confirm their own delivery, a
 dishonest artisan could call it (and then `release()`) without ever doing the work. `cancel()` is
-only reachable from `ORDER_PLACED`: once the artisan acknowledges, walking away requires a dispute
-instead. The four states at the bottom (`ORDER_FULFILLED`, `ORDER_CANCELLED`,
-`ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED`, `ORDER_DISPUTE_RESOLVED`) are terminal — every payout
-function checks the commission's current status before moving funds and flips it to a terminal
-value *before* sending any ETH, so calling a payout function twice on the same commission always
-reverts the second time.
+reachable from `ORDER_PLACED` or `ORDER_ACKNOWLEDGED`, but not once the artisan ships: from
+`ORDER_SHIPPED` onward, walking away requires a dispute instead. `refundAfterDeadline()` follows the
+same cutoff, for the opposite reason: it's a self-serve, no-questions-asked refund that's only fair
+while the *artisan* is the one who hasn't acted yet (never acknowledged/shipped); once they've
+shipped, a missed deadline is presumptively the *collector's* fault for not confirming, so from
+`ORDER_SHIPPED` onward a missed deadline can only be resolved via `raiseDispute()` - see
+[The 20% confirmation deposit](#the-20-confirmation-deposit) for why that matters. The four states at
+the bottom (`ORDER_FULFILLED`, `ORDER_CANCELLED`, `ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED`,
+`ORDER_DISPUTE_RESOLVED`) are terminal — every payout function checks the commission's current status
+before moving funds and flips it to a terminal value *before* sending any ETH, so calling a payout
+function twice on the same commission always reverts the second time.
+
+### The 20% confirmation deposit
+
+`confirmDelivery()` has to be collector-only (see above) - but that raises an obvious follow-up:
+what stops the collector from simply *never* confirming, leaving the artisan's completed work
+stuck in escrow forever? The answer is a refundable deposit, not a trust assumption:
+
+- The collector locks **120% of the agreed price** at `createCommission()` - 100% is the true
+  commission price, 20% is a good-faith confirmation deposit. `commissionPrice()` and
+  `collectorDeposit()` compute this split on demand from the total locked `amount` (never from a
+  separately-trusted number).
+- Confirm on time (before `deadline`, while `ORDER_SHIPPED`) and `release()` pays the artisan the
+  100% price *and* refunds the collector's 20% deposit in the same transaction - acting honestly
+  and promptly costs the collector nothing.
+- Let the deadline pass while `ORDER_SHIPPED` without confirming, and `confirmDelivery()` becomes
+  permanently blocked (`DeadlineAlreadyPassed`). The artisan's only recourse from there is
+  `raiseDispute()`.
+- `resolveDispute()` needs no special "forfeit the deposit" logic to punish that silence: it always
+  splits the *entire* locked 120% (minus the 1% arbiter fee) between the arbiter and whichever
+  party wins. So when an arbiter sides with an artisan who was stonewalled, the artisan
+  automatically receives the collector's deposit too - not just the price they were owed.
+- Before the artisan ships, none of this applies: `cancel()` and `refundAfterDeadline()` both
+  refund the collector's full 120%, since nothing has gone wrong on the collector's side yet.
 
 ### Roles
 
 | Role | Who | Can do |
 |---|---|---|
 | Collector | Whoever called `createCommission()` | `confirmDelivery()`, `cancel()`, `raiseDispute()` |
-| Artisan | The address named in `createCommission()` | `acknowledgeCommission()`, `cancel()`, `raiseDispute()` |
+| Artisan | The address named in `createCommission()` | `acknowledgeCommission()`, `orderShipped()`, `cancel()`, `raiseDispute()` |
 | Arbiter | Any address the factory admin has granted `ARBITER_ROLE` (via `grantRole`) | `resolveDispute()` on **any** disputed commission from **any** collector/artisan pair — this shared roster plus the 1% fee is the "marketplace" that keeps disputes from sitting open forever |
 | Anyone | — | `release()`, `refundAfterDeadline()` — deliberately unrestricted, since there's nothing to gain by gatekeeping who *triggers* a payout that's already fully determined by on-chain state |
 
 `cancel()` can be called by either the collector or the artisan, but only while the commission is
-still `ORDER_PLACED` — the moment the artisan acknowledges it, `cancel()` becomes unreachable for
-both parties and a dispute is the only way to unwind the deal.
+still `ORDER_PLACED` or `ORDER_ACKNOWLEDGED` — the moment the artisan ships, `cancel()` becomes
+unreachable for both parties and a dispute is the only way to unwind the deal.
 
 ## Deploying to Base Sepolia
 
