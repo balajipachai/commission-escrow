@@ -4,6 +4,568 @@
  */
 import { GenericContractsDeclaration } from "~~/utils/scaffold-eth/contract";
 
-const deployedContracts = {} as const;
+const deployedContracts = {
+  31337: {
+    CommissionEscrowFactory: {
+      address: "0x700b6a60ce7eaaea56f065753d8dcb9653dbad35",
+      abi: [
+        {
+          type: "constructor",
+          inputs: [
+            {
+              name: "admin",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          stateMutability: "nonpayable",
+        },
+        {
+          type: "function",
+          name: "ARBITER_ROLE",
+          inputs: [],
+          outputs: [
+            {
+              name: "",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "DEFAULT_ADMIN_ROLE",
+          inputs: [],
+          outputs: [
+            {
+              name: "",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "allCommissions",
+          inputs: [
+            {
+              name: "",
+              type: "uint256",
+              internalType: "uint256",
+            },
+          ],
+          outputs: [
+            {
+              name: "",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "commissionsByArtisan",
+          inputs: [
+            {
+              name: "artisan",
+              type: "address",
+              internalType: "address",
+            },
+            {
+              name: "",
+              type: "uint256",
+              internalType: "uint256",
+            },
+          ],
+          outputs: [
+            {
+              name: "commissions",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "commissionsByCollector",
+          inputs: [
+            {
+              name: "collector",
+              type: "address",
+              internalType: "address",
+            },
+            {
+              name: "",
+              type: "uint256",
+              internalType: "uint256",
+            },
+          ],
+          outputs: [
+            {
+              name: "commissions",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "createCommission",
+          inputs: [
+            {
+              name: "artisan",
+              type: "address",
+              internalType: "address",
+            },
+            {
+              name: "deadline",
+              type: "uint256",
+              internalType: "uint256",
+            },
+          ],
+          outputs: [
+            {
+              name: "commission",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          stateMutability: "payable",
+        },
+        {
+          type: "function",
+          name: "disputedCommissions",
+          inputs: [
+            {
+              name: "",
+              type: "uint256",
+              internalType: "uint256",
+            },
+          ],
+          outputs: [
+            {
+              name: "",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "escrowImplementation",
+          inputs: [],
+          outputs: [
+            {
+              name: "",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "getAllCommissions",
+          inputs: [],
+          outputs: [
+            {
+              name: "",
+              type: "address[]",
+              internalType: "address[]",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "getCommissionsByArtisan",
+          inputs: [
+            {
+              name: "artisan",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [
+            {
+              name: "",
+              type: "address[]",
+              internalType: "address[]",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "getCommissionsByCollector",
+          inputs: [
+            {
+              name: "collector",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [
+            {
+              name: "",
+              type: "address[]",
+              internalType: "address[]",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "getDisputedCommissions",
+          inputs: [],
+          outputs: [
+            {
+              name: "",
+              type: "address[]",
+              internalType: "address[]",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "getRoleAdmin",
+          inputs: [
+            {
+              name: "role",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+          ],
+          outputs: [
+            {
+              name: "",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "grantRole",
+          inputs: [
+            {
+              name: "role",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+            {
+              name: "account",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [],
+          stateMutability: "nonpayable",
+        },
+        {
+          type: "function",
+          name: "hasRole",
+          inputs: [
+            {
+              name: "role",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+            {
+              name: "account",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [
+            {
+              name: "",
+              type: "bool",
+              internalType: "bool",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "isCommission",
+          inputs: [
+            {
+              name: "commission",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [
+            {
+              name: "isCommission",
+              type: "bool",
+              internalType: "bool",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "notifyDisputeSettled",
+          inputs: [
+            {
+              name: "commission",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [],
+          stateMutability: "nonpayable",
+        },
+        {
+          type: "function",
+          name: "notifyDisputed",
+          inputs: [
+            {
+              name: "commission",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [],
+          stateMutability: "nonpayable",
+        },
+        {
+          type: "function",
+          name: "renounceRole",
+          inputs: [
+            {
+              name: "role",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+            {
+              name: "callerConfirmation",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [],
+          stateMutability: "nonpayable",
+        },
+        {
+          type: "function",
+          name: "revokeRole",
+          inputs: [
+            {
+              name: "role",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+            {
+              name: "account",
+              type: "address",
+              internalType: "address",
+            },
+          ],
+          outputs: [],
+          stateMutability: "nonpayable",
+        },
+        {
+          type: "function",
+          name: "supportsInterface",
+          inputs: [
+            {
+              name: "interfaceId",
+              type: "bytes4",
+              internalType: "bytes4",
+            },
+          ],
+          outputs: [
+            {
+              name: "",
+              type: "bool",
+              internalType: "bool",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "function",
+          name: "totalCommissions",
+          inputs: [],
+          outputs: [
+            {
+              name: "",
+              type: "uint256",
+              internalType: "uint256",
+            },
+          ],
+          stateMutability: "view",
+        },
+        {
+          type: "event",
+          name: "CommissionCreated",
+          inputs: [
+            {
+              name: "commission",
+              type: "address",
+              indexed: true,
+              internalType: "address",
+            },
+            {
+              name: "collector",
+              type: "address",
+              indexed: true,
+              internalType: "address",
+            },
+            {
+              name: "artisan",
+              type: "address",
+              indexed: true,
+              internalType: "address",
+            },
+            {
+              name: "amount",
+              type: "uint256",
+              indexed: false,
+              internalType: "uint256",
+            },
+            {
+              name: "deadline",
+              type: "uint256",
+              indexed: false,
+              internalType: "uint256",
+            },
+          ],
+          anonymous: false,
+        },
+        {
+          type: "event",
+          name: "RoleAdminChanged",
+          inputs: [
+            {
+              name: "role",
+              type: "bytes32",
+              indexed: true,
+              internalType: "bytes32",
+            },
+            {
+              name: "previousAdminRole",
+              type: "bytes32",
+              indexed: true,
+              internalType: "bytes32",
+            },
+            {
+              name: "newAdminRole",
+              type: "bytes32",
+              indexed: true,
+              internalType: "bytes32",
+            },
+          ],
+          anonymous: false,
+        },
+        {
+          type: "event",
+          name: "RoleGranted",
+          inputs: [
+            {
+              name: "role",
+              type: "bytes32",
+              indexed: true,
+              internalType: "bytes32",
+            },
+            {
+              name: "account",
+              type: "address",
+              indexed: true,
+              internalType: "address",
+            },
+            {
+              name: "sender",
+              type: "address",
+              indexed: true,
+              internalType: "address",
+            },
+          ],
+          anonymous: false,
+        },
+        {
+          type: "event",
+          name: "RoleRevoked",
+          inputs: [
+            {
+              name: "role",
+              type: "bytes32",
+              indexed: true,
+              internalType: "bytes32",
+            },
+            {
+              name: "account",
+              type: "address",
+              indexed: true,
+              internalType: "address",
+            },
+            {
+              name: "sender",
+              type: "address",
+              indexed: true,
+              internalType: "address",
+            },
+          ],
+          anonymous: false,
+        },
+        {
+          type: "error",
+          name: "AccessControlBadConfirmation",
+          inputs: [],
+        },
+        {
+          type: "error",
+          name: "AccessControlUnauthorizedAccount",
+          inputs: [
+            {
+              name: "account",
+              type: "address",
+              internalType: "address",
+            },
+            {
+              name: "neededRole",
+              type: "bytes32",
+              internalType: "bytes32",
+            },
+          ],
+        },
+        {
+          type: "error",
+          name: "FailedDeployment",
+          inputs: [],
+        },
+        {
+          type: "error",
+          name: "InsufficientBalance",
+          inputs: [
+            {
+              name: "balance",
+              type: "uint256",
+              internalType: "uint256",
+            },
+            {
+              name: "needed",
+              type: "uint256",
+              internalType: "uint256",
+            },
+          ],
+        },
+      ],
+      inheritedFunctions: {},
+      deployedOnBlock: 1,
+    },
+  },
+} as const;
 
 export default deployedContracts satisfies GenericContractsDeclaration;

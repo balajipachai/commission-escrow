@@ -63,8 +63,7 @@ contract VerifyAll is Script {
 
         bytes memory constructorArgs;
         if (deployedBytecode.length > compiledLen) {
-            constructorArgs =
-                BytesLib.slice(deployedBytecode, compiledLen, deployedBytecode.length - compiledLen);
+            constructorArgs = BytesLib.slice(deployedBytecode, compiledLen, deployedBytecode.length - compiledLen);
         } else {
             constructorArgs = new bytes(0);
         }
@@ -122,7 +121,11 @@ contract VerifyAll is Script {
             inputs[0] = "bash";
             inputs[1] = "-c";
             inputs[2] = string.concat(
-                "find '", root, "/out' -name '", contractName, ".json' -not -path '*/build-info/*' -print -quit | tr -d '\\n'"
+                "find '",
+                root,
+                "/out' -name '",
+                contractName,
+                ".json' -not -path '*/build-info/*' -print -quit | tr -d '\\n'"
             );
             FfiResult memory f = tempVm(address(vm)).tryFfi(inputs);
             return string(f.stdout);
@@ -153,11 +156,10 @@ contract VerifyAll is Script {
     /// scan the broadcast file; for each tx's `contractName` we compute the solc placeholder
     /// (`__$<keccak256(path:name)[0:17] as hex>$__`) and check whether it appears in the
     /// compiled bytecode. A hit identifies which broadcast deployment satisfies the link.
-    function _discoverLibraries(
-        string memory artifactJson,
-        string memory bytecodeHex,
-        string memory broadcastContent
-    ) internal returns (string[] memory) {
+    function _discoverLibraries(string memory artifactJson, string memory bytecodeHex, string memory broadcastContent)
+        internal
+        returns (string[] memory)
+    {
         string[] memory libPaths;
         try vm.parseJsonKeys(artifactJson, ".bytecode.linkReferences") returns (string[] memory paths) {
             libPaths = paths;
@@ -183,11 +185,10 @@ contract VerifyAll is Script {
         return result;
     }
 
-    function _resolveLibrary(
-        string memory libPath,
-        string memory bytecodeHex,
-        string memory broadcastContent
-    ) internal returns (bool, string memory, address) {
+    function _resolveLibrary(string memory libPath, string memory bytecodeHex, string memory broadcastContent)
+        internal
+        returns (bool, string memory, address)
+    {
         for (uint256 i = 0;; i++) {
             string memory nameKey = string.concat(".transactions[", vm.toString(i), "].contractName");
             bytes memory nameBytes;
@@ -205,8 +206,7 @@ contract VerifyAll is Script {
             if (_stringContains(bytecodeHex, placeholder)) {
                 address addr = abi.decode(
                     vm.parseJson(
-                        broadcastContent,
-                        string.concat(".transactions[", vm.toString(i), "].contractAddress")
+                        broadcastContent, string.concat(".transactions[", vm.toString(i), "].contractAddress")
                     ),
                     (address)
                 );
@@ -216,11 +216,7 @@ contract VerifyAll is Script {
     }
 
     /// @dev solc library placeholder: `__$<keccak256(path:name)[0:17] hex>$__` (40 chars = 20 bytes).
-    function _computePlaceholder(string memory libPath, string memory libName)
-        internal
-        pure
-        returns (string memory)
-    {
+    function _computePlaceholder(string memory libPath, string memory libName) internal pure returns (string memory) {
         bytes32 h = keccak256(abi.encodePacked(libPath, ":", libName));
         bytes memory hexChars = "0123456789abcdef";
         bytes memory out = new bytes(40);
