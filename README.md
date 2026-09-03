@@ -16,7 +16,7 @@ wagmi / viem), targeting Base Sepolia.
 ```
 Collector ──funds (120%)──▶  CommissionEscrow  ──on-time delivery──▶  100% to Artisan, 20% back to Collector
                               (one per deal)    ──refunds on timeout (pre-shipping)──▶  120% to Collector
-                                                 ──splits on dispute─────▶  120% (minus 1% fee) to the winner
+                                                 ──N-of-M arbiter vote──▶  120% (minus 1% fee) to the winner
 ```
 
 ## What's actually in here
@@ -25,15 +25,17 @@ Collector ──funds (120%)──▶  CommissionEscrow  ──on-time delivery�
   here with the agreed price attached as `msg.value`. Internally it deploys a cheap [EIP-1167
   minimal proxy clone](https://eips.ethereum.org/EIPS/eip-1167) of `CommissionEscrow` for that one
   deal (so every commission gets its own contract, without paying full deployment gas each time).
-  It also holds the global, OpenZeppelin-`AccessControl`-backed `ARBITER_ROLE` roster, and a public
+  It also holds the global, OpenZeppelin-`AccessControl`-backed `ARBITER_ROLE` roster, the
+  configurable N-of-M `arbiterThreshold` disputes must reach before they finalize, and a public
   list of every commission currently in dispute — the "marketplace" any approved arbiter can pick
   work from.
 - **`CommissionEscrow.sol`** — the escrow logic itself, one instance per commission. Handles
   funding, artisan acknowledgment/shipping, collector delivery confirmation (with a refundable
-  confirmation deposit — see below), payout, timeout refunds, early cancellation, and dispute
-  resolution. Uses OpenZeppelin's `ReentrancyGuard` and the Checks-Effects-Interactions pattern
-  throughout, so state is always finalized before any ETH leaves the contract.
-- **`packages/foundry/test/`** — 56 Foundry tests covering the full lifecycle (see [Running the
+  confirmation deposit — see below), payout, timeout refunds, early cancellation, and N-of-M
+  arbiter-vote dispute resolution. Uses OpenZeppelin's `ReentrancyGuard` and the
+  Checks-Effects-Interactions pattern throughout, so state is always finalized before any ETH
+  leaves the contract.
+- **`packages/foundry/test/`** — 66 Foundry tests covering the full lifecycle (see [Running the
   tests](#running-the-tests) below).
 - **`packages/nextjs/`** — the stock Scaffold-ETH 2 frontend. No custom pages were built for this
   challenge; the built-in **Debug Contracts** page is enough to fund, confirm, release, dispute and
@@ -85,7 +87,10 @@ factory clones from). The deployer always gets `DEFAULT_ADMIN_ROLE`; `ARBITER_RO
 whatever address is set in the `INITIAL_ARBITER` environment variable, or falls back to the
 deployer if that's unset — so there's always at least one working arbiter out of the box, but a
 real deployment can hand day-to-day dispute resolution to a separate address (e.g. a multisig)
-from the start. The script then auto-generates the TypeScript ABI the frontend needs at
+from the start. The starting `arbiterThreshold` (how many matching arbiter votes a dispute needs
+to finalize — see [N-of-M arbiter voting](#n-of-m-arbiter-voting) below) comes from
+`INITIAL_ARBITER_THRESHOLD`, defaulting to `1` since a fresh deployment only has one arbiter. The
+script then auto-generates the TypeScript ABI the frontend needs at
 `packages/nextjs/contracts/deployedContracts.ts`.
 
 **4. Terminal 3 — start the frontend**
@@ -123,12 +128,14 @@ A full happy-path walkthrough:
    collector automatically gets their 20% deposit back in the same transaction.
 6. To see the dispute path instead: at any point before release, **as the collector or artisan**,
    call `raiseDispute()`. As the deployer (who holds `ARBITER_ROLE` unless you configured a
-   different `INITIAL_ARBITER`), call `resolveDispute(true)` (pay the artisan the full 120%) or
-   `resolveDispute(false)` (refund the collector the full 120%) — the resolving address always
-   keeps a 1% fee off the top.
+   different `INITIAL_ARBITER`), call `castArbiterVote(true)` (vote to pay the artisan the full
+   120%) or `castArbiterVote(false)` (vote to refund the collector the full 120%). With the default
+   `arbiterThreshold` of `1`, that single vote finalizes immediately and the voting arbiter keeps a
+   1% fee off the top — see [N-of-M arbiter voting](#n-of-m-arbiter-voting) below for what happens
+   with more than one arbiter.
 7. To see the "collector goes silent" punishment path: after step 3's `orderShipped()`, let the
    `deadline` pass **without** calling `confirmDelivery()` — trying to call it now reverts. As the
-   artisan, call `raiseDispute()`, then resolve in the artisan's favor as the arbiter — the artisan
+   artisan, call `raiseDispute()`, then vote in the artisan's favor as the arbiter — the artisan
    receives the *entire* 120% (minus the 1% fee), deposit included, as the penalty for the
    collector's silence.
 8. To see the plain timeout path instead: let the `deadline` pass while still in `ORDER_PLACED` or
@@ -145,7 +152,7 @@ yarn foundry:test
 forge test -vv
 ```
 
-56 tests across two files, one function per numbered requirement (see comments in the test files
+66 tests across two files, one function per numbered requirement (see comments in the test files
 for the exact mapping):
 
 | # | Requirement | Covered in |
@@ -154,13 +161,14 @@ for the exact mapping):
 | 2 | Release requires confirmed delivery | `test_RevertWhen_ReleaseCalledBeforeDeliveryConfirmed`, `test_RevertWhen_ArtisanConfirmsOwnDelivery` (the artisan cannot fake their own delivery), `test_RevertWhen_ConfirmDeliveryAfterDeadline` (the collector can't stall forever either), `test_ReleaseSucceedsOnlyAfterCollectorConfirmsDeliveryOnTime` |
 | 3 | State updated before external transfer | `test_RevertWhen_MaliciousArtisanReentersOnRelease` (a hostile artisan contract tries to re-enter `release()` from its `receive()` hook) |
 | 4 | Timeout produces an explicit refund path | `test_RefundAfterDeadlineReturnsFundsToCollector`, `test_RevertWhen_RefundAttemptedOnDisputedCommissionAfterDeadline` |
-| 5 | Disputes aren't resolved by either party alone | `test_RevertWhen_CollectorResolvesOwnDispute`, `test_RevertWhen_ArtisanResolvesOwnDispute`, `test_ApprovedArbiterResolvesDisputeInFavorOfArtisan` |
+| 5 | Disputes aren't resolved by either party alone | `test_RevertWhen_CollectorVotesOnOwnDispute`, `test_RevertWhen_ArtisanVotesOnOwnDispute`, `test_SingleArbiterVoteFinalizesDisputeInFavorOfArtisan`, and the N-of-M voting tests in [below](#n-of-m-arbiter-voting) |
 | 6 | Commission amount comes from value actually sent | `test_AmountIsSetFromActualMsgValueNotACallerArgument` |
-| 7 | No double release of the same commission | `test_RevertWhen_ReleaseCalledTwice`, `test_RevertWhen_RefundAfterDeadlineCalledTwice`, `test_RevertWhen_ResolveDisputeCalledTwice` |
+| 7 | No double release of the same commission | `test_RevertWhen_ReleaseCalledTwice`, `test_RevertWhen_RefundAfterDeadlineCalledTwice`, `test_RevertWhen_VotingAgainAfterDisputeAlreadyResolved` |
 | 8 | No credentials in tracked files | see [Security & repo hygiene](#security--repo-hygiene) below |
 
 `CommissionEscrowFactory.t.sol` additionally covers clone deployment gas savings, the `AccessControl`
-arbiter roster, and the disputed-commissions "marketplace" list lifecycle.
+arbiter roster, `arbiterThreshold` configuration, and the disputed-commissions "marketplace" list
+lifecycle.
 
 ## The commission lifecycle
 
@@ -179,7 +187,7 @@ stateDiagram-v2
     ORDER_ACKNOWLEDGED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
     ORDER_SHIPPED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
     ORDER_DELIVERED --> ORDER_DISPUTED: raiseDispute()\n[collector or artisan]
-    ORDER_DISPUTED --> ORDER_DISPUTE_RESOLVED: resolveDispute()\n[arbiter only, 120% minus 1% fee]
+    ORDER_DISPUTED --> ORDER_DISPUTE_RESOLVED: castArbiterVote()\n[N-of-M arbiters, 120% minus 1% fee]
     ORDER_FULFILLED --> [*]
     ORDER_CANCELLED --> [*]
     ORDER_CANCELLED_DUE_TO_TIMELINE_EXCEEDED --> [*]
@@ -217,12 +225,36 @@ stuck in escrow forever? The answer is a refundable deposit, not a trust assumpt
 - Let the deadline pass while `ORDER_SHIPPED` without confirming, and `confirmDelivery()` becomes
   permanently blocked (`DeadlineAlreadyPassed`). The artisan's only recourse from there is
   `raiseDispute()`.
-- `resolveDispute()` needs no special "forfeit the deposit" logic to punish that silence: it always
+- `castArbiterVote()` needs no special "forfeit the deposit" logic to punish that silence: it always
   splits the *entire* locked 120% (minus the 1% arbiter fee) between the arbiter and whichever
   party wins. So when an arbiter sides with an artisan who was stonewalled, the artisan
   automatically receives the collector's deposit too - not just the price they were owed.
 - Before the artisan ships, none of this applies: `cancel()` and `refundAfterDeadline()` both
   refund the collector's full 120%, since nothing has gone wrong on the collector's side yet.
+
+### N-of-M arbiter voting
+
+A single `ARBITER_ROLE` holder is a single point of trust — nothing on-chain stops them from
+lying, whether by mistake or in collusion with one of the parties. `castArbiterVote()` fixes this:
+disputes aren't resolved by one arbiter's unilateral call, but by however many *independent*
+arbiters the factory's `arbiterThreshold` requires agreeing on the same verdict.
+
+- Any address holding `ARBITER_ROLE` can call `castArbiterVote(releaseToArtisan)` on a disputed
+  commission — once, per commission (a second vote from the same arbiter reverts `AlreadyVoted`).
+- The moment either side's vote count reaches `CommissionEscrowFactory.arbiterThreshold()`, that
+  same call finalizes the dispute and pays out immediately — there's no separate "finalize" step.
+- The 1% arbiter fee is split evenly among only the arbiters who voted for the **winning** side;
+  voting for the side that doesn't reach the threshold first earns nothing. This keeps voting
+  honest — an arbiter's payout depends on the group actually agreeing with them, not on merely
+  having voted.
+- `arbiterThreshold` starts at `1` on a fresh deployment (see `INITIAL_ARBITER_THRESHOLD` above) so
+  the lone initial arbiter can still resolve disputes alone, and can be raised later by
+  `DEFAULT_ADMIN_ROLE` via `setArbiterThreshold()` as more arbiters are granted the role.
+- Nothing on-chain can stop several arbiters from colluding together, either — N-of-M voting
+  raises the cost of collusion from "corrupt one address" to "corrupt (or deceive) several", it
+  doesn't make it cryptographically impossible. Every vote (`ArbiterVoteCast`) and the final
+  outcome (`DisputeResolved`) are permanently, publicly logged with each arbiter's own address, and
+  `ARBITER_ROLE` is revocable at any time if one is caught out.
 
 ### Roles
 
@@ -230,7 +262,7 @@ stuck in escrow forever? The answer is a refundable deposit, not a trust assumpt
 |---|---|---|
 | Collector | Whoever called `createCommission()` | `confirmDelivery()`, `cancel()`, `raiseDispute()` |
 | Artisan | The address named in `createCommission()` | `acknowledgeCommission()`, `orderShipped()`, `cancel()`, `raiseDispute()` |
-| Arbiter | Any address the factory admin has granted `ARBITER_ROLE` (via `grantRole`) | `resolveDispute()` on **any** disputed commission from **any** collector/artisan pair — this shared roster plus the 1% fee is the "marketplace" that keeps disputes from sitting open forever |
+| Arbiter | Any address the factory admin has granted `ARBITER_ROLE` (via `grantRole`) | `castArbiterVote()` on **any** disputed commission from **any** collector/artisan pair — this shared roster plus a share of the 1% fee is the "marketplace" that keeps disputes from sitting open forever. See [N-of-M arbiter voting](#n-of-m-arbiter-voting) above |
 | Anyone | — | `release()`, `refundAfterDeadline()` — deliberately unrestricted, since there's nothing to gain by gatekeeping who *triggers* a payout that's already fully determined by on-chain state |
 
 `cancel()` can be called by either the collector or the artisan, but only while the commission is
@@ -248,7 +280,10 @@ unreachable for both parties and a dispute is the only way to unwind the deal.
 3. Add your own `ALCHEMY_API_KEY` (and optionally `ETHERSCAN_API_KEY` for verification) to
    `packages/foundry/.env` — copy `.env.example` first if you haven't. Optionally also set
    `INITIAL_ARBITER` to a different address (e.g. a multisig) if you don't want the deployer itself
-   holding `ARBITER_ROLE` — it defaults to the deployer if left unset.
+   holding `ARBITER_ROLE` — it defaults to the deployer if left unset. If you plan to onboard
+   multiple arbiters right away, also set `INITIAL_ARBITER_THRESHOLD` to how many of them must
+   agree before a dispute finalizes (see [N-of-M arbiter voting](#n-of-m-arbiter-voting)) — it
+   defaults to `1`.
 4. Deploy:
    ```bash
    yarn deploy --network baseSepolia
@@ -279,9 +314,14 @@ The implementation address is deployed internally by the factory's constructor (
 log, so it had to be verified as a separate `forge verify-contract` call rather than picked up by
 `yarn verify`'s automatic sweep.
 
+> **Note:** this live deployment predates the N-of-M arbiter voting feature (it has a two-argument
+> `CommissionEscrowFactory` constructor and a single-arbiter `resolveDispute()`, not
+> `castArbiterVote()`). Redeploy following the steps above to get a factory with `arbiterThreshold`
+> support on Base Sepolia.
+
 ## Security & repo hygiene
 
-- **Reentrancy**: `release()`, `cancel()`, `refundAfterDeadline()` and `resolveDispute()` are all
+- **Reentrancy**: `release()`, `cancel()`, `refundAfterDeadline()` and `castArbiterVote()` are all
   `nonReentrant` *and* follow Checks-Effects-Interactions — `status` is flipped to its terminal
   value before any ETH transfer. See `test_RevertWhen_MaliciousArtisanReentersOnRelease`.
 - **Clone safety**: the shared `CommissionEscrow` implementation calls `_disableInitializers()` in
@@ -307,11 +347,6 @@ README, using Scaffold-ETH 2's stock Debug Contracts page as the UI. Left for la
   of the disputed-commissions "marketplace" for arbiters.
 - Wiring `confirmDelivery()` to a real off-chain oracle/keeper that watches a carrier's AWB
   (air waybill) tracking status, instead of a direct collector-triggered call.
-- **N-of-M / multisig-style arbiter voting.** `resolveDispute()` currently trusts a single
-  `ARBITER_ROLE` holder's verdict — nothing on-chain can stop a colluding arbiter from lying (see
-  the `@dev` block on `resolveDispute()` for the full reasoning on why the verdict has to be a
-  function parameter in the first place). Requiring several independent arbiters to agree before
-  funds move would raise the cost of collusion considerably and is the natural next step here.
 - Hardening: a formal audit / Slither static-analysis pass, fuzz and invariant tests (Foundry
   supports both) on top of the current unit tests, an upgrade path for the arbiter fee percentage,
   and event indexing (a subgraph or similar) so front-ends aren't limited to on-chain reads.
