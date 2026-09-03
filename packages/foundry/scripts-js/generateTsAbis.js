@@ -83,6 +83,22 @@ function getDeploymentHistory(broadcastPath) {
           receipt: receipts.find((r) => r.transactionHash === tx.hash),
         });
       }
+
+      // Contracts created inside another contract's constructor (e.g. an implementation
+      // contract deployed by a factory via `new`) show up as nested `additionalContracts`
+      // entries rather than top-level transactions, so they need to be captured separately.
+      for (const additionalContract of tx.additionalContracts || []) {
+        if (additionalContract.transactionType !== "CREATE" && additionalContract.transactionType !== "CREATE2") {
+          continue;
+        }
+        deploymentHistory.set(additionalContract.address, {
+          contractName: additionalContract.contractName,
+          address: additionalContract.address,
+          deploymentFile: file,
+          transaction: tx,
+          receipt: receipts.find((r) => r.transactionHash === tx.hash),
+        });
+      }
     }
   }
 
