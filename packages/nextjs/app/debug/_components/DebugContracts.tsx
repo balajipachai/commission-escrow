@@ -9,6 +9,9 @@ import { ContractName, GenericContract } from "~~/utils/scaffold-eth/contract";
 import { useAllContracts } from "~~/utils/scaffold-eth/contractsData";
 
 const selectedContractStorageKey = "scaffoldEth2.selectedContract";
+// Shown by default when present, since it's the entry point collectors/artisans interact
+// with first (individual CommissionEscrow clones are reached by clicking their own tab).
+const defaultContractName = "CommissionEscrowFactory" as ContractName;
 
 export function DebugContracts() {
   const contractsData = useAllContracts();
@@ -20,17 +23,19 @@ export function DebugContracts() {
     [contractsData],
   );
 
+  const fallbackContractName = contractNames.includes(defaultContractName) ? defaultContractName : contractNames[0];
+
   const [selectedContract, setSelectedContract] = useSessionStorage<ContractName>(
     selectedContractStorageKey,
-    contractNames[0],
+    fallbackContractName,
     { initializeWithValue: false },
   );
 
   useEffect(() => {
     if (!contractNames.includes(selectedContract)) {
-      setSelectedContract(contractNames[0]);
+      setSelectedContract(fallbackContractName);
     }
-  }, [contractNames, selectedContract, setSelectedContract]);
+  }, [contractNames, selectedContract, setSelectedContract, fallbackContractName]);
 
   return (
     <div className="flex flex-col gap-y-6 lg:gap-y-8 py-8 lg:py-12 justify-center items-center">
