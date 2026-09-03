@@ -20,6 +20,10 @@ interface ICommissionEscrowFactory {
 
     /// @notice Called by a commission when its dispute has just been resolved.
     function notifyDisputeSettled(address commission) external;
+
+    /// @notice The number of matching arbiter votes a disputed commission needs before it can be
+    /// finalized. See {CommissionEscrow-castArbiterVote}.
+    function arbiterThreshold() external view returns (uint256);
 }
 
 /**
@@ -37,8 +41,9 @@ interface ICommissionEscrowFactory {
  *           3. `refundAfterDeadline()` -> the full 120% refunded to the collector if the deadline
  *              passes before the artisan even ships - a failure that is the artisan's, not the
  *              collector's, fault.
- *           4. `resolveDispute()` -> the full 120% (minus a 1% arbiter fee) goes entirely to
- *              whichever party the arbiter sides with.
+ *           4. `castArbiterVote()` -> once enough approved arbiters agree on the same outcome (see
+ *              "N-OF-M ARBITER VOTING" below), the full 120% (minus a 1% arbiter fee) goes entirely
+ *              to whichever party they sided with.
  *
  * @dev DESIGN NOTES FOR NEWCOMERS
  *
@@ -77,13 +82,25 @@ interface ICommissionEscrowFactory {
  *   their 20% back in the very same `release()` call that pays the artisan - confirming promptly
  *   costs them nothing. If they let the deadline pass while the artisan has already shipped
  *   (`ORDER_SHIPPED`), `confirmDelivery()` itself becomes permanently blocked (see its docs), and
- *   the artisan's only recourse is `raiseDispute()`. Critically, `resolveDispute()` does not need
+ *   the artisan's only recourse is `raiseDispute()`. Critically, `castArbiterVote()` does not need
  *   any special-cased "deposit forfeiture" logic to punish a stalling collector: it already splits
  *   the *entire* locked `amount` - deposit included - between the arbiter's fee and whichever party
  *   the arbiter sides with. So if the arbiter agrees the artisan was stiffed, the artisan
  *   automatically receives the full 120% (minus the arbiter's 1% cut), not just the 100% price -
  *   exactly the punishment a silent collector deserves, without a single extra line of "if the
  *   collector missed the deadline, pay extra" code.
+ *
+ * N-OF-M ARBITER VOTING - why a single arbiter's word is never enough to move funds:
+ *   A lone `ARBITER_ROLE` holder is a single point of trust: nothing on-chain stops them from lying,
+ *   whether by mistake or in collusion with one of the parties. `castArbiterVote()` fixes this by
+ *   requiring `CommissionEscrowFactory.arbiterThreshold()` *independent* arbiters to cast the same
+ *   verdict before a dispute finalizes - reaching that bar requires that many separate people to be
+ *   wrong (or corrupt) together, not just one. Each arbiter votes at most once per dispute (see
+ *   {hasVotedOnDispute}); the moment either side's vote count reaches the threshold, that same call
+ *   pays out immediately - there is no separate "finalize" step for anyone to forget to call. The 1%
+ *   arbiter fee is split evenly among only the arbiters who voted for the winning side, so an
+ *   arbiter's payout depends on the group actually agreeing with them, not merely on having shown up
+ *   to vote.
  */
 contract CommissionEscrow is Initializable, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
@@ -122,11 +139,12 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
      *  ORDER_DISPUTED                       Either party disagrees about delivery, or the collector
      *                                        has gone silent past the deadline after the artisan
      *                                        shipped. Funds are frozen - no release, no refund -
-     *                                        until an approved arbiter steps in and calls
-     *                                        `resolveDispute()`.
-     *  ORDER_DISPUTE_RESOLVED               Terminal. An arbiter decided the dispute; the winning
-     *                                        party was paid the full 120% (minus a 1% arbiter fee)
-     *                                        and the losing party got nothing.
+     *                                        until enough approved arbiters agree on a verdict via
+     *                                        `castArbiterVote()` (see "N-OF-M ARBITER VOTING" above).
+     *  ORDER_DISPUTE_RESOLVED               Terminal. Enough arbiters agreed on a verdict; the
+     *                                        winning party was paid the full 120% (minus a 1%
+     *                                        arbiter fee, split among the winning-side voters) and
+     *                                        the losing party got nothing.
      *
      * The happy path is strictly linear:
      *   ORDER_PLACED --acknowledgeCommission()--> ORDER_ACKNOWLEDGED --orderShipped()-->
@@ -217,6 +235,9 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     /// @notice Thrown when a native ETH transfer made by this contract fails.
     error EthTransferFailed();
 
+    /// @notice Thrown when an arbiter who already voted on the current dispute tries to vote again.
+    error AlreadyVoted();
+
     // ---------------------------------------------------------------------------------------------
     // Storage
     // ---------------------------------------------------------------------------------------------
@@ -253,6 +274,17 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     /// useful for arbiters and front-ends deciding how to weigh the dispute.
     address public disputeInitiator;
 
+    /// @notice `true` once `arbiter` has cast a vote on this commission's dispute. A commission can
+    /// only ever be disputed once (resolving it moves `status` to the terminal
+    /// `ORDER_DISPUTE_RESOLVED`), so there is no need to track votes per "round".
+    mapping(address arbiter => bool voted) public hasVotedOnDispute;
+
+    /// @notice Arbiters who have voted to release the full locked amount to the artisan.
+    address[] public artisanVoters;
+
+    /// @notice Arbiters who have voted to refund the full locked amount to the collector.
+    address[] public collectorVoters;
+
     // ---------------------------------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------------------------------
@@ -286,9 +318,18 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
     /// @notice Emitted when either party opens a dispute.
     event DisputeRaised(address indexed initiator, uint256 timestamp);
 
-    /// @notice Emitted when an arbiter resolves an open dispute.
+    /// @notice Emitted every time an arbiter casts a vote on an open dispute. `votesForChoice` is the
+    /// running tally for `releaseToArtisan`'s side *after* this vote, so watchers can see how close
+    /// the dispute is to the factory's `arbiterThreshold()` without a separate view call.
+    event ArbiterVoteCast(address indexed arbiter, bool releaseToArtisan, uint256 votesForChoice);
+
+    /// @notice Emitted once a dispute's vote tally reaches the required threshold and funds move.
     event DisputeResolved(
-        address indexed arbiter, bool releasedToArtisan, uint256 arbiterFee, uint256 partyPayout, address indexed paidTo
+        bool releasedToArtisan,
+        uint256 arbiterFeeTotal,
+        uint256 partyPayout,
+        address indexed paidTo,
+        uint256 arbiterCount
     );
 
     // ---------------------------------------------------------------------------------------------
@@ -588,60 +629,106 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
 
     /**
      * @notice Lets an approved arbiter (an address the factory has granted `ARBITER_ROLE`, and
-     * therefore, critically, an address distinct from both `collector` and `artisan`) settle a
-     * disputed commission one way or the other.
-     * @dev Pays the resolving arbiter a 1% fee (see {ARBITER_FEE_BPS}) out of the *entire* locked
-     * `amount` (100% price + 20% deposit) as a reward for doing the work of resolving the
-     * disagreement, and sends the remaining 99% to whichever side the arbiter decided should
-     * receive it - deliberately not just the 100% price. This is what makes disputing a silent,
-     * past-deadline collector actually punitive: the artisan does not just recover the price they
-     * were owed, they also receive the collector's own forfeited confirmation deposit, with no
-     * extra "was the deadline missed" logic needed here at all - splitting the full `amount` this
-     * way already produces that outcome automatically. Follows Checks-Effects-Interactions: `status`
-     * moves to the terminal `ORDER_DISPUTE_RESOLVED` value, and this commission is removed from the
-     * factory's disputed-commissions list, before either ETH transfer is attempted.
+     * therefore, critically, an address distinct from both `collector` and `artisan`) cast one vote
+     * on how a disputed commission should be settled. Once enough arbiters agree on the same
+     * outcome, this same call finalizes the dispute and pays out immediately - see "N-OF-M ARBITER
+     * VOTING" in the contract-level docs for the full reasoning.
+     * @dev Each arbiter may vote exactly once per dispute (tracked via {hasVotedOnDispute}) and
+     * cannot change their vote afterwards - same as a real vote, this keeps the tally simple and
+     * stops an arbiter from watching the running tally (see {ArbiterVoteCast}) and flip-flopping to
+     * whichever side is about to win regardless of their own judgment.
      *
      * WHY `releaseToArtisan` IS A FUNCTION PARAMETER, NOT SOMETHING READ FROM STORAGE:
      * There is no on-chain fact this contract could look up that would tell it whether the
      * collector's physical painting actually arrived - that is precisely the real-world question the
-     * two parties disagree about, and precisely why a human arbiter is needed at all. If the answer
+     * two parties disagree about, and precisely why human arbiters are needed at all. If the answer
      * were derivable from contract storage, there would be nothing to dispute: the contract could
      * simply resolve itself. `releaseToArtisan` is not an input the contract trusts blindly - it *is*
-     * the arbiter's verdict, which by definition cannot exist anywhere before the arbiter renders it.
+     * each arbiter's individual verdict, which by definition cannot exist anywhere before they render
+     * it.
      *
-     * WHAT STOPS A COLLUDING ARBITER FROM LYING: nothing at the smart-contract level can force an
-     * arbiter to tell the truth - that is an inherent limitation of trusting a single third party to
-     * arbitrate, not a bug specific to this function. What this design *does* provide:
-     *   - Every resolution is permanently, publicly logged via {DisputeResolved}, including the
-     *     arbiter's own address and their exact verdict - a colluding arbiter cannot act
+     * WHAT STOPS COLLUDING ARBITERS FROM LYING: nothing at the smart-contract level can force an
+     * arbiter to tell the truth - that is an inherent limitation of trusting third parties to
+     * arbitrate, not a bug specific to this function. What this design provides:
+     *   - Reaching `CommissionEscrowFactory.arbiterThreshold()` requires that many *independent*
+     *     `ARBITER_ROLE` holders to collectively agree on the same, possibly wrong, outcome - raising
+     *     the cost of collusion from "corrupt one address" to "corrupt (or deceive) several".
+     *   - Every vote is permanently, publicly logged via {ArbiterVoteCast}, and the final outcome via
+     *     {DisputeResolved} - including each voting arbiter's own address - so no arbiter can act
      *     anonymously or deniably.
      *   - `ARBITER_ROLE` is revocable at any time by the factory's `DEFAULT_ADMIN_ROLE` holder
      *     (`CommissionEscrowFactory.revokeRole`), so a caught-out arbiter can be removed from all
      *     future disputes immediately.
      *   - The original project brief explicitly treats "an arbiter, multisig, or DAO" as
-     *     interchangeable resolution mechanisms and leaves the exact choice to the implementer. A
-     *     single approved address is the simplest version of that spectrum; requiring several
-     *     independent `ARBITER_ROLE` holders to agree (N-of-M voting) before funds move would raise
-     *     the cost of collusion considerably and is the natural next step - tracked as a future-scope
-     *     item in the README rather than built here, to keep this contract's trust model explicit
-     *     and easy to reason about today.
-     * @param releaseToArtisan Pass `true` if the arbiter decided delivery genuinely happened, or
-     * that the collector wrongfully withheld confirmation (pay the artisan the full 120%); pass
-     * `false` if the arbiter sided with the collector (refund the collector the full 120%).
+     *     interchangeable resolution mechanisms and leaves the exact choice to the implementer; this
+     *     N-of-M vote is that spectrum's more collusion-resistant end.
+     * @param releaseToArtisan Pass `true` to vote for paying the artisan the full 120% locked amount
+     * (delivery genuinely happened, or the collector wrongfully withheld confirmation), or `false`
+     * to vote for refunding the collector the full 120%.
      */
-    function resolveDispute(bool releaseToArtisan) external nonReentrant onlyArbiter inStatus(Status.ORDER_DISPUTED) {
+    function castArbiterVote(bool releaseToArtisan) external nonReentrant onlyArbiter inStatus(Status.ORDER_DISPUTED) {
+        if (hasVotedOnDispute[msg.sender]) revert AlreadyVoted();
+        hasVotedOnDispute[msg.sender] = true;
+
+        address[] storage votersForChoice = releaseToArtisan ? artisanVoters : collectorVoters;
+        votersForChoice.push(msg.sender);
+        emit ArbiterVoteCast(msg.sender, releaseToArtisan, votersForChoice.length);
+
+        uint256 threshold = ICommissionEscrowFactory(factory).arbiterThreshold();
+        if (votersForChoice.length < threshold) return;
+
+        _finalizeDispute(releaseToArtisan, votersForChoice);
+    }
+
+    /**
+     * @dev Pays out a disputed commission once its vote tally reached the required threshold. Splits
+     * a 1% fee (see {ARBITER_FEE_BPS}) out of the *entire* locked `amount` (100% price + 20%
+     * deposit) evenly among the winning-side voters, and sends the remaining ~99% to whichever party
+     * they sided with - deliberately not just the 100% price. This is what makes disputing a silent,
+     * past-deadline collector actually punitive: the artisan does not just recover the price they
+     * were owed, they also receive the collector's own forfeited confirmation deposit, with no extra
+     * "was the deadline missed" logic needed here at all. Follows Checks-Effects-Interactions:
+     * `status` moves to the terminal `ORDER_DISPUTE_RESOLVED` value, and this commission is removed
+     * from the factory's disputed-commissions list, before any ETH transfer is attempted.
+     * @param winningVoters The arbiters whose vote matched `releaseToArtisan` - always exactly
+     * `arbiterThreshold()` addresses, since `castArbiterVote` calls this the instant that count is
+     * first reached and no further votes can land afterwards (the dispute is already resolved).
+     */
+    function _finalizeDispute(bool releaseToArtisan, address[] storage winningVoters) private {
         status = Status.ORDER_DISPUTE_RESOLVED;
         ICommissionEscrowFactory(factory).notifyDisputeSettled(address(this));
 
         uint256 totalAmount = amount;
-        uint256 arbiterFee = (totalAmount * ARBITER_FEE_BPS) / BPS_DENOMINATOR;
-        uint256 partyPayout = totalAmount - arbiterFee;
+        uint256 arbiterFeeTotal = (totalAmount * ARBITER_FEE_BPS) / BPS_DENOMINATOR;
         address recipient = releaseToArtisan ? artisan : collector;
 
-        _transferETH(msg.sender, arbiterFee);
+        uint256 winnerCount = winningVoters.length;
+        uint256 feePerArbiter = arbiterFeeTotal / winnerCount;
+        // Integer division can leave up to `winnerCount - 1` wei undistributed across individual
+        // arbiter shares; folding that dust into the party payout (instead of stranding it in the
+        // contract) keeps the full `amount` fully accounted for between the arbiters and the winner.
+        uint256 partyPayout = totalAmount - (feePerArbiter * winnerCount);
+
+        for (uint256 i = 0; i < winnerCount; i++) {
+            _transferETH(winningVoters[i], feePerArbiter);
+        }
         _transferETH(recipient, partyPayout);
 
-        emit DisputeResolved(msg.sender, releaseToArtisan, arbiterFee, partyPayout, recipient);
+        emit DisputeResolved(releaseToArtisan, arbiterFeeTotal, partyPayout, recipient, winnerCount);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Views: current dispute vote tally
+    // ---------------------------------------------------------------------------------------------
+
+    /// @notice Every arbiter who has voted to release the locked amount to the artisan so far.
+    function getArtisanVoters() external view returns (address[] memory) {
+        return artisanVoters;
+    }
+
+    /// @notice Every arbiter who has voted to refund the locked amount to the collector so far.
+    function getCollectorVoters() external view returns (address[] memory) {
+        return collectorVoters;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -660,8 +747,8 @@ contract CommissionEscrow is Initializable, ReentrancyGuard {
         // success check (not `.transfer`/`.send`) is the currently recommended way to send ETH,
         // since `.transfer`/`.send` hard-cap forwarded gas at 2300 and break against smart-contract
         // wallets or any receive()/fallback() doing more than a trivial write. `to` is always
-        // `collector`, `artisan`, or the resolving arbiter - never attacker-controlled - and every
-        // call site already applies Checks-Effects-Interactions plus `nonReentrant`.
+        // `collector`, `artisan`, or a winning-side voting arbiter - never attacker-controlled - and
+        // every call site already applies Checks-Effects-Interactions plus `nonReentrant`.
         (bool success,) = to.call{ value: value }("");
         if (!success) revert EthTransferFailed();
     }

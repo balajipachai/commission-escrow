@@ -16,17 +16,22 @@ import { CommissionEscrow } from "./CommissionEscrow.sol";
  *      deployment, which saves the vast majority of the gas a `new CommissionEscrow(...)` call
  *      would otherwise cost.
  *   2. The arbiter registry - an `AccessControl` role (`ARBITER_ROLE`) that any commission clone
- *      can check to decide whether `msg.sender` is allowed to resolve a dispute. Approving an
- *      arbiter here makes them able to resolve *any* disputed commission created by this factory.
+ *      can check to decide whether `msg.sender` is allowed to vote on a dispute. Approving an
+ *      arbiter here makes them able to vote on *any* disputed commission created by this factory.
  *   3. The dispute "marketplace" - a public, always-up-to-date list of every commission that is
  *      currently disputed, so an arbiter can simply browse {getDisputedCommissions} to find work
- *      (and earn the 1% resolution fee described in {CommissionEscrow-resolveDispute}).
+ *      (and earn a share of the 1% resolution fee described in
+ *      {CommissionEscrow-castArbiterVote}).
+ *   4. The vote-threshold registry - {arbiterThreshold} says how many arbiters must agree on the
+ *      same verdict before a disputed commission's {CommissionEscrow-castArbiterVote} pays out, so
+ *      no single `ARBITER_ROLE` holder can unilaterally move funds.
  *
  * @dev DEFAULT_ADMIN_ROLE (granted to the `admin` address passed into the constructor - see
  * `DeployCommissionEscrowFactory.s.sol`) is the only role that can grant/revoke `ARBITER_ROLE`, via
  * the standard `AccessControl.grantRole` / `revokeRole` functions inherited below. There is
  * intentionally no custom "addArbiter" function - `AccessControl`'s own functions already do
- * exactly that, correctly, and reusing them means less custom code to get wrong.
+ * exactly that, correctly, and reusing them means less custom code to get wrong. `DEFAULT_ADMIN_ROLE`
+ * also controls {arbiterThreshold} via {setArbiterThreshold}.
  */
 contract CommissionEscrowFactory is AccessControl {
     // ---------------------------------------------------------------------------------------------
@@ -58,6 +63,10 @@ contract CommissionEscrowFactory is AccessControl {
     /// @notice Thrown when `notifyDisputeSettled` is called for a commission not on the disputed list.
     error NotListedAsDisputed();
 
+    /// @notice Thrown when the constructor or `setArbiterThreshold` is given a threshold of zero -
+    /// a dispute with a zero-vote requirement could never actually require any arbiter to agree.
+    error ThresholdMustBePositive();
+
     // ---------------------------------------------------------------------------------------------
     // Storage
     // ---------------------------------------------------------------------------------------------
@@ -66,6 +75,13 @@ contract CommissionEscrowFactory is AccessControl {
     /// once, in this factory's constructor, and then never touched directly again - all real
     /// commissions live in clones pointing at this address.
     address public immutable escrowImplementation;
+
+    /// @notice The number of matching arbiter votes a disputed commission needs before
+    /// {CommissionEscrow-castArbiterVote} finalizes it. Set at deployment and adjustable afterwards
+    /// by `DEFAULT_ADMIN_ROLE` via {setArbiterThreshold} - e.g. to raise it as more arbiters are
+    /// onboarded. See {CommissionEscrow}'s "N-OF-M ARBITER VOTING" docs for why requiring more than
+    /// one arbiter's agreement matters.
+    uint256 public arbiterThreshold;
 
     /// @notice Every commission clone this factory has ever created, in creation order.
     address[] public allCommissions;
@@ -99,6 +115,9 @@ contract CommissionEscrowFactory is AccessControl {
         address indexed commission, address indexed collector, address indexed artisan, uint256 amount, uint256 deadline
     );
 
+    /// @notice Emitted whenever `DEFAULT_ADMIN_ROLE` changes {arbiterThreshold}.
+    event ArbiterThresholdUpdated(uint256 previousThreshold, uint256 newThreshold);
+
     // ---------------------------------------------------------------------------------------------
     // Modifiers
     // ---------------------------------------------------------------------------------------------
@@ -122,15 +141,38 @@ contract CommissionEscrowFactory is AccessControl {
      * automatically reusing `admin`) so that deployments can hand day-to-day dispute resolution to a
      * different address - e.g. a dedicated multisig - than the address controlling role management.
      * `admin` and `arbiter` may be the same address if that separation isn't needed.
+     * @param initialArbiterThreshold Starting value for {arbiterThreshold} - how many matching
+     * arbiter votes a dispute needs to finalize. A deployment that starts with a single arbiter (as
+     * above) should start this at `1` so that lone arbiter can still resolve disputes immediately;
+     * {setArbiterThreshold} can raise it later as more arbiters are granted `ARBITER_ROLE`.
      */
-    constructor(address admin, address arbiter) {
+    constructor(address admin, address arbiter, uint256 initialArbiterThreshold) {
         if (admin == address(0)) revert ZeroAddress();
         if (arbiter == address(0)) revert ZeroAddress();
+        if (initialArbiterThreshold == 0) revert ThresholdMustBePositive();
 
         escrowImplementation = address(new CommissionEscrow());
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ARBITER_ROLE, arbiter);
+        arbiterThreshold = initialArbiterThreshold;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Admin configuration
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * @notice Updates how many matching arbiter votes a disputed commission needs before it can be
+     * finalized. Only affects disputes resolved *after* this call - a dispute already mid-vote
+     * simply needs the new threshold's vote count on whichever side reaches it next.
+     * @param newThreshold The new required vote count. Must be at least `1`.
+     */
+    function setArbiterThreshold(uint256 newThreshold) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newThreshold == 0) revert ThresholdMustBePositive();
+
+        emit ArbiterThresholdUpdated(arbiterThreshold, newThreshold);
+        arbiterThreshold = newThreshold;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -191,8 +233,8 @@ contract CommissionEscrowFactory is AccessControl {
 
     /**
      * @notice Removes `commission` from the public disputed-commissions list. Called automatically
-     * by a {CommissionEscrow} clone from inside its own `resolveDispute()` - never call this
-     * directly.
+     * by a {CommissionEscrow} clone from inside its own `castArbiterVote()` once a dispute's vote
+     * tally is finalized - never call this directly.
      * @dev Uses swap-and-pop so removal is O(1) regardless of list size.
      */
     function notifyDisputeSettled(address commission) external onlyGenuineCommission(commission) {

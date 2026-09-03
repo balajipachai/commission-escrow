@@ -28,8 +28,9 @@ contract CommissionEscrowFactoryTest is Test {
     function setUp() public {
         // `admin` is passed as both the admin and the initial arbiter here purely for test
         // convenience - see test_ConstructorGrantsDistinctRolesToDistinctAddresses below for
-        // coverage of the two parameters actually being independent.
-        factory = new CommissionEscrowFactory(admin, admin);
+        // coverage of the two parameters actually being independent. Threshold starts at `1` so
+        // this lone arbiter can still resolve a dispute alone.
+        factory = new CommissionEscrowFactory(admin, admin, 1);
         deadline = block.timestamp + 7 days;
         vm.deal(collector, 100 ether);
     }
@@ -42,7 +43,7 @@ contract CommissionEscrowFactoryTest is Test {
     /// @notice The constructor's `admin` and `arbiter` parameters are independent: passing distinct
     /// addresses must grant each address only its own role, not both roles to both addresses.
     function test_ConstructorGrantsDistinctRolesToDistinctAddresses() public {
-        CommissionEscrowFactory distinctFactory = new CommissionEscrowFactory(admin, arbiter);
+        CommissionEscrowFactory distinctFactory = new CommissionEscrowFactory(admin, arbiter, 1);
 
         assertTrue(distinctFactory.hasRole(distinctFactory.DEFAULT_ADMIN_ROLE(), admin));
         assertFalse(distinctFactory.hasRole(distinctFactory.ARBITER_ROLE(), admin));
@@ -53,12 +54,22 @@ contract CommissionEscrowFactoryTest is Test {
 
     function test_RevertWhen_ConstructorGivenZeroAddressAdmin() public {
         vm.expectRevert(CommissionEscrowFactory.ZeroAddress.selector);
-        new CommissionEscrowFactory(address(0), arbiter);
+        new CommissionEscrowFactory(address(0), arbiter, 1);
     }
 
     function test_RevertWhen_ConstructorGivenZeroAddressArbiter() public {
         vm.expectRevert(CommissionEscrowFactory.ZeroAddress.selector);
-        new CommissionEscrowFactory(admin, address(0));
+        new CommissionEscrowFactory(admin, address(0), 1);
+    }
+
+    function test_RevertWhen_ConstructorGivenZeroThreshold() public {
+        vm.expectRevert(CommissionEscrowFactory.ThresholdMustBePositive.selector);
+        new CommissionEscrowFactory(admin, arbiter, 0);
+    }
+
+    function test_ConstructorSetsInitialArbiterThreshold() public {
+        CommissionEscrowFactory customFactory = new CommissionEscrowFactory(admin, arbiter, 3);
+        assertEq(customFactory.arbiterThreshold(), 3);
     }
 
     function test_RevertWhen_NonAdminGrantsArbiterRole() public {
@@ -142,8 +153,30 @@ contract CommissionEscrowFactoryTest is Test {
         assertEq(factory.getDisputedCommissions().length, 2);
 
         vm.prank(admin);
-        CommissionEscrow(payable(commissionA)).resolveDispute(false);
+        CommissionEscrow(payable(commissionA)).castArbiterVote(false);
         assertEq(factory.getDisputedCommissions().length, 1);
         assertEq(factory.getDisputedCommissions()[0], commissionB);
+    }
+
+    function test_AdminCanRaiseArbiterThreshold() public {
+        vm.prank(admin);
+        factory.setArbiterThreshold(3);
+        assertEq(factory.arbiterThreshold(), 3);
+    }
+
+    function test_RevertWhen_NonAdminSetsArbiterThreshold() public {
+        bytes32 defaultAdminRole = factory.DEFAULT_ADMIN_ROLE();
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, defaultAdminRole)
+        );
+        factory.setArbiterThreshold(3);
+    }
+
+    function test_RevertWhen_SetArbiterThresholdGivenZero() public {
+        vm.prank(admin);
+        vm.expectRevert(CommissionEscrowFactory.ThresholdMustBePositive.selector);
+        factory.setArbiterThreshold(0);
     }
 }

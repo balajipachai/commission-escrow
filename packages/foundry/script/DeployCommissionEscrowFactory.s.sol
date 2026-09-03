@@ -16,7 +16,11 @@ import { CommissionEscrowFactory } from "../contracts/CommissionEscrowFactory.so
  * in the `INITIAL_ARBITER` environment variable, or falls back to `deployer` if that variable is
  * unset - so there is always at least one working arbiter as soon as the factory is live, but a
  * real deployment can hand day-to-day dispute resolution to a separate address (e.g. a multisig)
- * from the start. See the factory's constructor.
+ * from the start. The starting {CommissionEscrowFactory-arbiterThreshold} (how many matching
+ * arbiter votes a dispute needs to finalize) comes from `INITIAL_ARBITER_THRESHOLD`, defaulting to
+ * `1` if unset - a fresh deployment only has one arbiter, so requiring more than one vote out of
+ * the box would leave every dispute permanently stuck until `setArbiterThreshold` is called. Raise
+ * it once more arbiters have been granted `ARBITER_ROLE`. See the factory's constructor.
  *
  * Example:
  * yarn deploy --file DeployCommissionEscrowFactory.s.sol            # local anvil chain
@@ -34,6 +38,7 @@ contract DeployCommissionEscrowFactory is ScaffoldETHDeploy {
      */
     function run() external ScaffoldEthDeployerRunner {
         address initialArbiter = vm.envOr("INITIAL_ARBITER", deployer);
-        new CommissionEscrowFactory(deployer, initialArbiter);
+        uint256 initialArbiterThreshold = vm.envOr("INITIAL_ARBITER_THRESHOLD", uint256(1));
+        new CommissionEscrowFactory(deployer, initialArbiter, initialArbiterThreshold);
     }
 }

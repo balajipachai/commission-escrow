@@ -20,6 +20,8 @@ contract CommissionEscrowTest is Test {
     address internal collector = makeAddr("collector");
     address internal artisan = makeAddr("artisan");
     address internal arbiter = makeAddr("arbiter");
+    address internal arbiterTwo = makeAddr("arbiterTwo");
+    address internal arbiterThree = makeAddr("arbiterThree");
     address internal stranger = makeAddr("stranger");
 
     // `COMMISSION_PRICE` here is the total ETH locked at creation - 120% of the true commission
@@ -30,13 +32,17 @@ contract CommissionEscrowTest is Test {
 
     function setUp() public {
         // `admin` is passed as both the admin and the initial arbiter here purely for test
-        // convenience (see CommissionEscrowFactory.t.sol for coverage of them being distinct).
-        factory = new CommissionEscrowFactory(admin, admin);
+        // convenience (see CommissionEscrowFactory.t.sol for coverage of them being distinct). The
+        // threshold starts at `1` so a lone arbiter's vote still finalizes a dispute immediately -
+        // the N-of-M voting tests below raise it explicitly where they need more than one voter.
+        factory = new CommissionEscrowFactory(admin, admin, 1);
         deadline = block.timestamp + 7 days;
 
         vm.deal(collector, 100 ether);
         vm.deal(artisan, 10 ether);
         vm.deal(arbiter, 10 ether);
+        vm.deal(arbiterTwo, 10 ether);
+        vm.deal(arbiterThree, 10 ether);
     }
 
     /// @dev Helper: opens a standard commission from `collector` to `artisan` for `COMMISSION_PRICE`.
@@ -381,7 +387,7 @@ contract CommissionEscrowTest is Test {
     // Test Case 5 - Disputes aren't resolved by either party alone
     // =================================================================================================
 
-    function test_RevertWhen_CollectorResolvesOwnDispute() public {
+    function test_RevertWhen_CollectorVotesOnOwnDispute() public {
         CommissionEscrow escrow = _createCommission();
         _fullyDeliver(escrow);
         vm.prank(collector);
@@ -389,24 +395,24 @@ contract CommissionEscrowTest is Test {
 
         vm.prank(collector);
         vm.expectRevert(CommissionEscrow.NotArbiter.selector);
-        escrow.resolveDispute(false);
+        escrow.castArbiterVote(false);
     }
 
-    function test_RevertWhen_ArtisanResolvesOwnDispute() public {
+    function test_RevertWhen_ArtisanVotesOnOwnDispute() public {
         CommissionEscrow escrow = _createCommission();
         vm.prank(collector);
         escrow.raiseDispute();
 
         vm.prank(artisan);
         vm.expectRevert(CommissionEscrow.NotArbiter.selector);
-        escrow.resolveDispute(true);
+        escrow.castArbiterVote(true);
     }
 
-    function test_RevertWhen_ResolvingDisputeThatWasNeverRaised() public {
+    function test_RevertWhen_VotingOnDisputeThatWasNeverRaised() public {
         CommissionEscrow escrow = _createCommission();
         vm.prank(admin); // admin holds ARBITER_ROLE from the factory constructor
         vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
-        escrow.resolveDispute(true);
+        escrow.castArbiterVote(true);
     }
 
     function test_RaiseDisputeReachableFromAcknowledgedStatus() public {
@@ -434,7 +440,7 @@ contract CommissionEscrowTest is Test {
     /// artisan ships, the collector lets the deadline pass without confirming, the artisan disputes,
     /// and the arbiter sides with the artisan. The artisan must receive the *entire* 120% locked
     /// amount (minus the arbiter's 1% fee) - not just the 100% price - with no special-cased
-    /// "forfeited deposit" logic required anywhere: `resolveDispute` already splits the full `amount`.
+    /// "forfeited deposit" logic required anywhere: `castArbiterVote` already splits the full `amount`.
     function test_ArbiterAwardsFullAmountToArtisanWhenCollectorMissesConfirmationDeadline() public {
         _grantArbiterRole(arbiter);
 
@@ -450,7 +456,7 @@ contract CommissionEscrowTest is Test {
         uint256 artisanBalanceBefore = artisan.balance;
 
         vm.prank(arbiter);
-        escrow.resolveDispute(true);
+        escrow.castArbiterVote(true);
 
         assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTE_RESOLVED));
         assertEq(
@@ -465,7 +471,7 @@ contract CommissionEscrowTest is Test {
         );
     }
 
-    function test_ApprovedArbiterResolvesDisputeInFavorOfArtisan() public {
+    function test_SingleArbiterVoteFinalizesDisputeInFavorOfArtisan() public {
         _grantArbiterRole(arbiter);
 
         CommissionEscrow escrow = _createCommission();
@@ -481,15 +487,17 @@ contract CommissionEscrowTest is Test {
         uint256 expectedFee = (COMMISSION_PRICE * escrow.ARBITER_FEE_BPS()) / escrow.BPS_DENOMINATOR();
 
         vm.prank(arbiter);
-        escrow.resolveDispute(true);
+        escrow.castArbiterVote(true);
 
         assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTE_RESOLVED));
-        assertEq(arbiter.balance, arbiterBalanceBefore + expectedFee, "arbiter should earn the 1% fee");
+        assertEq(
+            arbiter.balance, arbiterBalanceBefore + expectedFee, "the lone voting arbiter should earn the full 1% fee"
+        );
         assertEq(artisan.balance, artisanBalanceBefore + (COMMISSION_PRICE - expectedFee));
         assertEq(factory.getDisputedCommissions().length, 0, "commission should leave the disputed list");
     }
 
-    function test_ApprovedArbiterResolvesDisputeInFavorOfCollector() public {
+    function test_SingleArbiterVoteFinalizesDisputeInFavorOfCollector() public {
         _grantArbiterRole(arbiter);
 
         CommissionEscrow escrow = _createCommission();
@@ -500,10 +508,132 @@ contract CommissionEscrowTest is Test {
         uint256 expectedFee = (COMMISSION_PRICE * escrow.ARBITER_FEE_BPS()) / escrow.BPS_DENOMINATOR();
 
         vm.prank(arbiter);
-        escrow.resolveDispute(false);
+        escrow.castArbiterVote(false);
 
         assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTE_RESOLVED));
         assertEq(collector.balance, collectorBalanceBefore + (COMMISSION_PRICE - expectedFee));
+    }
+
+    // =================================================================================================
+    // Test Case 5b - N-of-M arbiter voting (multi-signature dispute resolution)
+    // =================================================================================================
+
+    /// @dev Helper: grants three distinct addresses `ARBITER_ROLE` and raises the factory's
+    /// threshold to 2, the shared setup for every multi-arbiter-vote test below.
+    function _setUpThreeArbitersWithThresholdOf(uint256 threshold) internal {
+        _grantArbiterRole(arbiter);
+        _grantArbiterRole(arbiterTwo);
+        _grantArbiterRole(arbiterThree);
+        vm.prank(admin);
+        factory.setArbiterThreshold(threshold);
+    }
+
+    function test_SingleVoteDoesNotFinalizeWhenThresholdIsTwo() public {
+        _setUpThreeArbitersWithThresholdOf(2);
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(collector);
+        escrow.raiseDispute();
+
+        vm.prank(arbiter);
+        escrow.castArbiterVote(true);
+
+        assertEq(
+            uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTED), "must stay open below threshold"
+        );
+        assertEq(escrow.getArtisanVoters().length, 1);
+        assertEq(factory.getDisputedCommissions().length, 1, "commission stays on the disputed list until finalized");
+    }
+
+    function test_SecondMatchingVoteFinalizesAndSplitsFeeEvenlyAmongWinners() public {
+        _setUpThreeArbitersWithThresholdOf(2);
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(collector);
+        escrow.raiseDispute();
+
+        vm.prank(arbiter);
+        escrow.castArbiterVote(true);
+
+        uint256 totalFee = (COMMISSION_PRICE * escrow.ARBITER_FEE_BPS()) / escrow.BPS_DENOMINATOR();
+        uint256 feePerArbiter = totalFee / 2;
+        uint256 artisanBalanceBefore = artisan.balance;
+        uint256 arbiterBalanceBefore = arbiter.balance;
+        uint256 arbiterTwoBalanceBefore = arbiterTwo.balance;
+
+        vm.prank(arbiterTwo);
+        escrow.castArbiterVote(true);
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTE_RESOLVED));
+        assertEq(arbiter.balance, arbiterBalanceBefore + feePerArbiter, "first winning voter gets an equal share");
+        assertEq(
+            arbiterTwo.balance, arbiterTwoBalanceBefore + feePerArbiter, "second winning voter gets an equal share"
+        );
+        assertEq(artisan.balance, artisanBalanceBefore + (COMMISSION_PRICE - totalFee));
+        assertEq(factory.getDisputedCommissions().length, 0);
+    }
+
+    /// @notice The incentive-compatibility proof for N-of-M voting: an arbiter who votes for the
+    /// side that does *not* reach the threshold first earns nothing, even though they voted.
+    function test_LosingSideVoterReceivesNoFee() public {
+        _setUpThreeArbitersWithThresholdOf(2);
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(collector);
+        escrow.raiseDispute();
+
+        vm.prank(arbiter);
+        escrow.castArbiterVote(false); // sides with the collector - ends up on the losing side
+        uint256 arbiterBalanceBefore = arbiter.balance;
+
+        vm.prank(arbiterTwo);
+        escrow.castArbiterVote(true);
+        vm.prank(arbiterThree);
+        escrow.castArbiterVote(true); // 2 artisan votes reach the threshold first
+
+        assertEq(uint256(escrow.status()), uint256(CommissionEscrow.Status.ORDER_DISPUTE_RESOLVED));
+        assertEq(arbiter.balance, arbiterBalanceBefore, "arbiter who voted for the losing side earns nothing");
+    }
+
+    function test_RevertWhen_ArbiterVotesTwiceOnSameDispute() public {
+        _setUpThreeArbitersWithThresholdOf(2);
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(collector);
+        escrow.raiseDispute();
+
+        vm.prank(arbiter);
+        escrow.castArbiterVote(true);
+
+        vm.prank(arbiter);
+        vm.expectRevert(CommissionEscrow.AlreadyVoted.selector);
+        escrow.castArbiterVote(true);
+    }
+
+    /// @notice Proves the full locked `amount` is always accounted for even when the 1% fee doesn't
+    /// divide evenly across the winning arbiters - the leftover wei must go to the winning party,
+    /// not get stranded in the contract.
+    function test_ArbiterFeeDustFoldsIntoPartyPayoutNotStranded() public {
+        _setUpThreeArbitersWithThresholdOf(3);
+        CommissionEscrow escrow = _createCommission();
+        vm.prank(collector);
+        escrow.raiseDispute();
+
+        vm.prank(arbiter);
+        escrow.castArbiterVote(false);
+        vm.prank(arbiterTwo);
+        escrow.castArbiterVote(false);
+
+        uint256 collectorBalanceBefore = collector.balance;
+        uint256 arbiterBalanceBefore = arbiter.balance;
+
+        vm.prank(arbiterThree);
+        escrow.castArbiterVote(false);
+
+        uint256 totalFee = (COMMISSION_PRICE * escrow.ARBITER_FEE_BPS()) / escrow.BPS_DENOMINATOR();
+        uint256 feePerArbiter = totalFee / 3;
+        uint256 dust = totalFee - (feePerArbiter * 3);
+        assertGt(dust, 0, "this test is only meaningful when the fee doesn't divide evenly by 3");
+
+        assertEq(arbiter.balance, arbiterBalanceBefore + feePerArbiter);
+        assertEq(collector.balance, collectorBalanceBefore + (COMMISSION_PRICE - totalFee) + dust);
+        assertEq(address(escrow).balance, 0, "every wei of the locked amount must be accounted for");
     }
 
     function test_RevertWhen_StrangerRaisesDispute() public {
@@ -535,19 +665,20 @@ contract CommissionEscrowTest is Test {
         escrow.refundAfterDeadline();
     }
 
-    function test_RevertWhen_ResolveDisputeCalledTwice() public {
+    function test_RevertWhen_VotingAgainAfterDisputeAlreadyResolved() public {
         _grantArbiterRole(arbiter);
 
         CommissionEscrow escrow = _createCommission();
         vm.prank(collector);
         escrow.raiseDispute();
 
+        // Threshold is 1 by default (see setUp), so this single vote already finalizes the dispute.
         vm.prank(arbiter);
-        escrow.resolveDispute(false);
+        escrow.castArbiterVote(false);
 
         vm.prank(arbiter);
         vm.expectRevert(CommissionEscrow.InvalidStatus.selector);
-        escrow.resolveDispute(false);
+        escrow.castArbiterVote(false);
     }
 
     function test_RevertWhen_ReleaseCalledAfterRefund() public {
